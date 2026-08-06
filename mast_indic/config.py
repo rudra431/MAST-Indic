@@ -1,0 +1,73 @@
+"""Central config, populated from environment variables (.env supported)."""
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+INDIC_LANGUAGES = ["bn", "gu", "hi", "kn", "ml", "or", "pa", "ta", "te"]
+
+
+def _int(name: str, default: int) -> int:
+    return int(os.environ.get(name, default))
+
+
+def _float(name: str, default: float) -> float:
+    return float(os.environ.get(name, default))
+
+
+def _bool(name: str, default: bool) -> bool:
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+
+@dataclass
+class Config:
+    # OpenAI-compatible chat/reasoning LLM (OpenAI, vLLM, Ollama's /v1, etc.)
+    openai_base_url: str = field(default_factory=lambda: os.environ.get(
+        "OPENAI_BASE_URL", "https://api.openai.com/v1"))
+    openai_api_key: str = field(default_factory=lambda: os.environ.get(
+        "OPENAI_API_KEY", "not-needed"))
+    chat_model: str = field(default_factory=lambda: os.environ.get(
+        "MAST_CHAT_MODEL", "gpt-4o-mini"))
+    temperature: float = field(default_factory=lambda: _float("MAST_TEMPERATURE", 0.0))
+
+    # Embeddings: any OpenAI-compatible /v1/embeddings server (Ollama, vLLM, TEI, ...),
+    # kept separate from the chat LLM on purpose. Defaults to local Ollama's
+    # OpenAI-compat route; point at a vLLM server by setting MAST_EMBED_BASE_URL.
+    embed_base_url: str = field(default_factory=lambda: os.environ.get(
+        "MAST_EMBED_BASE_URL",
+        os.environ.get("OLLAMA_HOST", "http://localhost:11434") + "/v1"))
+    embed_api_key: str = field(default_factory=lambda: os.environ.get(
+        "MAST_EMBED_API_KEY", "not-needed"))
+    embed_model: str = field(default_factory=lambda: os.environ.get(
+        "MAST_EMBED_MODEL", "embeddinggemma:300m"))
+
+    # Corpus / index
+    corpus_dataset: str = field(default_factory=lambda: os.environ.get(
+        "MAST_CORPUS_DATASET", "Tevatron/browsecomp-plus-corpus"))
+    queries_dataset: str = field(default_factory=lambda: os.environ.get(
+        "MAST_QUERIES_DATASET", "mast-benchmark/indic-queries-2026"))
+    index_dir: str = field(default_factory=lambda: os.environ.get(
+        "MAST_INDEX_DIR", "index_store"))
+    chunk_words: int = field(default_factory=lambda: _int("MAST_CHUNK_WORDS", 220))
+    chunk_overlap_words: int = field(default_factory=lambda: _int("MAST_CHUNK_OVERLAP_WORDS", 40))
+
+    # Agent loop / search tool
+    max_turns: int = field(default_factory=lambda: _int("MAST_MAX_TURNS", 8))
+    top_k: int = field(default_factory=lambda: _int("MAST_TOP_K", 5))
+    snippet_max_tokens: int = field(default_factory=lambda: _int("MAST_SNIPPET_MAX_TOKENS", 512))
+
+    # Output
+    runs_dir: str = field(default_factory=lambda: os.environ.get("MAST_RUNS_DIR", "runs"))
+
+    # Debugging: print each turn's reasoning/tool-calls/answer to stderr as they happen
+    debug: bool = field(default_factory=lambda: _bool("MAST_DEBUG", False))
+
+
+config = Config()

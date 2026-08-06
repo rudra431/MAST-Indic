@@ -1,0 +1,19 @@
+[project]
+name = "mast-indic"
+version = "0.1.0"
+description = "MAST @ FIRE 2026 Track 2 (Indic) - multilingual agentic search skeleton"
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.40",
+    "datasets>=2.20",
+    "numpy>=1.26",
+    "httpx>=0.27",
+    "tqdm>=4.66",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+faiss = ["faiss-cpu>=1.8"]
+
+[tool.setuptools.packages.find]
+include = ["mast_indic*"]
