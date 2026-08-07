@@ -7,14 +7,19 @@ copy of the BrowseComp-Plus corpus, answering queries from the
 
 ```
 mast_indic/
-  config.py    # env-driven settings
-  index.py     # build/query the local embedding index (OpenAI-compatible embeddings)
-  queries.py   # loads indic-queries-2026 per language
-  agent.py     # tool-calling agent loop (OpenAI-compatible client)
-  runner.py    # CLI: runs a language's queries -> submission JSONL
+  config.py          # env-driven settings
+  index.py           # build/query the local embedding index (OpenAI-compatible embeddings)
+  queries.py         # loads indic-queries-2026 per language
+  agent.py           # tool-calling agent loop, one `search` tool (OpenAI-compatible client)
+  runner.py          # CLI: runs agent.py over a language's queries -> submission JSONL
+  interact_engine.py # Interact-RAG-style retrieval action primitives (arXiv:2510.27566)
+  interact_agent.py  # agent loop using interact_engine.py instead of one `search` tool
+  interact_runner.py # CLI: runs interact_agent.py over a language's queries -> submission JSONL
+  eval.py            # CLI: LLM-judge scoring of a run against gold answers
 scripts/
   build_index.sh
   run_track2.sh
+  run_interact.sh
 ```
 
 ## Setup
@@ -116,6 +121,54 @@ example runs / evaluation code in the BrowseComp-Plus repo
 mirrors the fields documented on the repo page, but the repo itself is the
 source of truth, and the max-3-runs-per-language-per-team rule still applies.
 
+## 3. Evaluate
+
+```bash
+python -m mast_indic.eval \
+  --predictions runs/gpt-4o-mini/hi.jsonl \
+  --gold data/hi_gold.jsonl
+```
+
+`--predictions` accepts one or more run JSONL files, or a directory of them
+(each file is scored independently). `--gold` expects one JSON object per
+line with `task_id`, `question`, `gold_answer` fields.
+
+There are no relevance judgments (qrels) for this track, so this only scores
+answer correctness -- no retrieval recall, no citation precision/recall.
+
+For each query, an LLM judge grades the model's final answer against
+`gold_answer` and the script reports:
+
+- **Accuracy** -- % of responses the judge marks `correct: yes`
+- **Exact Match / F1** -- SQuAD-style string metrics comparing the model's
+  `Exact Answer:` line (or the judge's extracted answer, if parsed) against
+  `gold_answer`
+- **Calibration Error** -- from the judge's extracted confidence scores
+  (needs >=100 scored queries to be meaningful; reported as `N/A` below that)
+
+The judge is any OpenAI-compatible chat endpoint. It defaults to this
+project's `OPENAI_BASE_URL` / `OPENAI_API_KEY` / `MAST_CHAT_MODEL` from
+`.env`, but you'll usually want a separate/cheaper judge model -- override
+with `--judge_base_url` / `--judge_api_key` / `--judge_model` (or the
+`MAST_JUDGE_BASE_URL` / `MAST_JUDGE_API_KEY` / `MAST_JUDGE_MODEL` env vars),
+e.g. to point at a self-hosted vLLM/Ollama server serving something like
+`Qwen/Qwen3-32B`.
+
+Judging is cached per `query_id` in `{run}_eval.jsonl` -- rerunning without
+`--force` skips already-judged queries and only judges new/missing ones, so
+it's safe to rerun after adding predictions or recovering from a judge
+endpoint failure (a `401`/timeout on one query prints an error and records a
+parse error for that query instead of aborting the run).
+
+For each predictions file, writes to `--eval_dir` (default `./evals`):
+
+- `{run}_eval.jsonl` -- per-query judge prompt/response/parsed verdict (the resumable cache)
+- `{run}_summary.json` -- aggregate Accuracy/Exact Match/F1/Calibration Error + per-query metrics
+- `{run}_detailed.csv` -- one row per query: predicted vs. correct answer, judge verdict, EM/F1
+
+If multiple predictions files are evaluated in one invocation, also writes
+`evaluation_overview.json` with all of their summaries.
+
 ## How the agent works (`mast_indic/agent.py`)
 
 1. System prompt tells the LLM: query is in an Indic language, corpus and
@@ -134,12 +187,67 @@ query directly and formulate English search queries themselves. If you find a
 particular language/model combination struggles with this, consider adding an
 explicit translate-then-search step in `agent.py`.
 
+## Alternative agent: Interact-RAG-style interaction (`mast_indic/interact_agent.py`)
+
+[Interact-RAG (arXiv:2510.27566)](https://arxiv.org/abs/2510.27566) argues
+that a single black-box `search(query)` tool is too coarse: it forces the
+agent to encode every retrieval decision into one query string. Instead it
+gives the agent an explicit **Corpus Interaction Engine** of composable
+actions, and a **Global-Planner / Adaptive-Reasoner / Executor** workflow
+for deciding when to use which.
+
+`interact_agent.py` reuses `agent.py`'s tool-calling loop but swaps the one
+`search` tool for that action set, implemented in `interact_engine.py` on
+top of the same `SearchIndex`:
+
+- `semantic_search(query)` — dense embedding retrieval (what `agent.py`'s
+  `search` tool does)
+- `exact_search(keywords)` — sparse, case-insensitive keyword-count
+  retrieval (a lightweight stand-in for BM25 — see the module docstring)
+- `weighted_fusion(query, w_semantic, w_exact)` — blends the two for one query
+- `entity_match(entity)` — ranks chunks by literal mentions of a named
+  entity, dense similarity only breaking ties
+- `include_docs(doc_ids)` / `exclude_docs(doc_ids)` — pin or filter specific
+  documents across the rest of that query's retrievals
+- `adjust_scale(n)` — changes how many chunks come back per retrieval
+
+The system prompt asks the model to narrate Plan → Proceed-or-Reflect →
+Execute at each turn, and to call one or more of the actions above
+(multiple tool calls per turn are supported, same as `agent.py`).
+
+**What this is not:** the paper trains its agent (SFT on synthetic
+trajectories, then GRPO) to use these actions well. There's no training
+pipeline here — `interact_agent.py` is a zero-shot, prompted reproduction of
+just the *interaction interface*, relying on the chat model's own tool-use
+ability rather than a fine-tuned policy. Whether it beats the plain
+single-`search` agent depends entirely on how well your `MAST_CHAT_MODEL`
+follows the richer instructions zero-shot.
+
+```bash
+./scripts/run_interact.sh --language hi --limit 5   # smoke test
+./scripts/run_interact.sh --language hi              # full Hindi run
+```
+
+Writes `runs/{MAST_CHAT_MODEL}/interact_{language}.jsonl` — same record
+shape as `runner.py` (`retriever` is tagged `interact-rag/{embed_model}` to
+tell the two apart), so it evaluates with `eval.py` unchanged:
+
+```bash
+python -m mast_indic.eval \
+  --predictions runs/gpt-4o-mini/interact_hi.jsonl \
+  --gold data/hi_gold.jsonl
+```
+
 ## What's stubbed vs. real
 
 - **Real**: corpus loading, chunking, batch embedding, cosine search,
-  the tool-calling loop, JSONL output.
-- **Not included**: retrieval recall evaluation against qrels, and answer
-  accuracy via LLM-judge — both live in the BrowseComp-Plus repo's
-  `scripts_evaluation/`; run your generated `runs/` directory through
-  `evaluate_run.py` there once you have real relevance judgments for the
-  Indic queries.
+  both tool-calling agent loops (single-`search` and Interact-RAG-style),
+  JSONL output, and LLM-judge answer scoring (`mast_indic/eval.py`) —
+  Accuracy, Exact Match, F1, and calibration error.
+- **Not included**: Interact-RAG's SFT+RL training pipeline — `interact_agent.py`
+  is a zero-shot, prompted reproduction of its interaction interface only,
+  not a trained policy (see above). Also not included: retrieval recall and
+  citation precision/recall against qrels — there are no relevance-judgment
+  files for the Indic queries, so `eval.py` only scores final-answer
+  correctness. If real qrels become available, see the BrowseComp-Plus
+  repo's `scripts_evaluation/` for the retrieval-metric approach to port over.

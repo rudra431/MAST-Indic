@@ -19,7 +19,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import os
 import re
 import string
 import sys
@@ -609,18 +608,21 @@ def main():
     )
     parser.add_argument(
         "--judge_model",
-        default=os.environ.get("MAST_JUDGE_MODEL", config.chat_model),
-        help="Model used to judge predicted vs. gold answers",
+        default=config.judge_model,
+        help="Model used to judge predicted vs. gold answers "
+        "(default: MAST_JUDGE_MODEL, falling back to MAST_CHAT_MODEL)",
     )
     parser.add_argument(
         "--judge_base_url",
-        default=os.environ.get("MAST_JUDGE_BASE_URL", config.openai_base_url),
-        help="OpenAI-compatible base URL for the judge model",
+        default=config.judge_base_url,
+        help="OpenAI-compatible base URL for the judge model "
+        "(default: MAST_JUDGE_BASE_URL, falling back to OPENAI_BASE_URL)",
     )
     parser.add_argument(
         "--judge_api_key",
-        default=os.environ.get("MAST_JUDGE_API_KEY", config.openai_api_key),
-        help="API key for the judge model endpoint",
+        default=config.judge_api_key,
+        help="API key for the judge model endpoint "
+        "(default: MAST_JUDGE_API_KEY, falling back to OPENAI_API_KEY)",
     )
     parser.add_argument(
         "--temperature", type=float, default=0.0, help="Judge decoding temperature"

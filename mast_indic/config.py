@@ -43,6 +43,16 @@ class Config:
     request_timeout: float = field(default_factory=lambda: _float("MAST_REQUEST_TIMEOUT", 120.0))
     request_max_retries: int = field(default_factory=lambda: _int("MAST_REQUEST_MAX_RETRIES", 2))
 
+    # LLM judge (mast_indic/eval.py): defaults to the chat LLM above, since a
+    # single self-hosted endpoint is often all you have. Set MAST_JUDGE_* to
+    # point evaluation at a separate/cheaper judge model instead.
+    judge_base_url: str = field(default_factory=lambda: os.environ.get(
+        "MAST_JUDGE_BASE_URL", os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")))
+    judge_api_key: str = field(default_factory=lambda: os.environ.get(
+        "MAST_JUDGE_API_KEY", os.environ.get("OPENAI_API_KEY", "not-needed")))
+    judge_model: str = field(default_factory=lambda: os.environ.get(
+        "MAST_JUDGE_MODEL", os.environ.get("MAST_CHAT_MODEL", "gpt-4o-mini")))
+
     # Embeddings: any OpenAI-compatible /v1/embeddings server (Ollama, vLLM, TEI, ...),
     # kept separate from the chat LLM on purpose. Defaults to local Ollama's
     # OpenAI-compat route; point at a vLLM server by setting MAST_EMBED_BASE_URL.
