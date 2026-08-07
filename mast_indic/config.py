@@ -36,6 +36,12 @@ class Config:
     chat_model: str = field(default_factory=lambda: os.environ.get(
         "MAST_CHAT_MODEL", "gpt-4o-mini"))
     temperature: float = field(default_factory=lambda: _float("MAST_TEMPERATURE", 0.0))
+    # Per-request timeout to the chat LLM, and retries on transient failures
+    # (connect/read timeouts, 5xx) before giving up on a single call. Keep
+    # this well below your batch script's patience -- a hung/unreachable
+    # endpoint should fail one query fast, not stall the whole run.
+    request_timeout: float = field(default_factory=lambda: _float("MAST_REQUEST_TIMEOUT", 120.0))
+    request_max_retries: int = field(default_factory=lambda: _int("MAST_REQUEST_MAX_RETRIES", 2))
 
     # Embeddings: any OpenAI-compatible /v1/embeddings server (Ollama, vLLM, TEI, ...),
     # kept separate from the chat LLM on purpose. Defaults to local Ollama's

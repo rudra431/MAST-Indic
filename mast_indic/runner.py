@@ -36,9 +36,27 @@ def run_language(language: str, limit: int | None = None, save_transcripts: bool
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, f"{language}.jsonl")
 
+    num_failed = 0
     with open(out_path, "w", encoding="utf-8") as f:
         for q in tqdm(queries, desc=f"answering [{language}]"):
-            agent_result = agent.answer(q.qid, q.query, language=q.language)
+            try:
+                agent_result = agent.answer(q.qid, q.query, language=q.language)
+            except Exception as exc:  # noqa: BLE001 -- one bad query must not sink the batch
+                num_failed += 1
+                tqdm.write(f"[error] {q.qid} failed after retries: {exc!r}")
+                record = {
+                    "query_id": q.qid,
+                    "language": q.language,
+                    "retriever": config.embed_model,
+                    "llm": config.chat_model,
+                    "tool_call_counts": {},
+                    "retrieved_docids": [],
+                    "result": [],
+                    "error": repr(exc),
+                }
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                continue
+
             record = {
                 "query_id": agent_result.query_id,
                 "language": agent_result.language,
@@ -52,7 +70,7 @@ def run_language(language: str, limit: int | None = None, save_transcripts: bool
                 record["transcript"] = agent_result.transcript
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-    print(f"Wrote {len(queries)} records -> {out_path}")
+    print(f"Wrote {len(queries)} records ({num_failed} failed) -> {out_path}")
     return out_path
 
 

@@ -77,7 +77,12 @@ class AgentResult:
 class SearchAgent:
     def __init__(self, search_index: SearchIndex | None = None) -> None:
         self.index = search_index or SearchIndex()
-        self.client = OpenAI(base_url=config.openai_base_url, api_key=config.openai_api_key)
+        self.client = OpenAI(
+            base_url=config.openai_base_url,
+            api_key=config.openai_api_key,
+            timeout=config.request_timeout,
+            max_retries=config.request_max_retries,
+        )
 
     def _run_search_tool(self, query: str) -> tuple[str, list[str]]:
         hits = self.index.search(query, top_k=config.top_k, snippet_max_words=config.snippet_max_tokens)
