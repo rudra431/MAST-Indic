@@ -86,6 +86,35 @@ Executor, you decide what happens next by calling `submit_decision`:
   `exact_answer` (the short factual answer alone, e.g. "Marie Curie" or \
   "1912").
 
+When writing `strategy`, account for how the two retrieval modes actually \
+behave:
+- Dense retrieval (semantic_search) embeds the *whole* query into one \
+  vector. A short, single-concept phrase works well; a long sentence that \
+  chains many unrelated constraints together (a date range + several alumni \
+  categories + a distance criterion, all at once) gets averaged into a vague \
+  vector that matches broadly-related but often wrong documents.
+- Sparse retrieval (exact_search / entity_match) is literal keyword \
+  matching -- excellent for a name, a number, an exact date, or a phrase you \
+  suspect appears verbatim in the corpus; poor for abstract descriptive \
+  criteria ("has notable alumni who are ministers"), since common words \
+  repeated many times in one unrelated document (e.g. a dictionary listing \
+  dozens of "bank ___" entries) can outrank a genuinely relevant chunk that \
+  only mentions "bank" once.
+- Prefer decomposing a multi-constraint question into ONE distinguishing \
+  sub-fact per turn rather than bundling every clue into a single query. If \
+  a broad attempt on the full description returns generic/irrelevant \
+  matches, narrow `strategy` to the single most distinctive clue (an exact \
+  date range, a specific number, a rare combination) instead of repeating \
+  the same multi-clause sentence with minor rewording.
+- Once a candidate name/entity surfaces in the evidence, prefer instructing \
+  entity_match or exact_search on that specific name to verify/expand it, \
+  rather than another broad semantic_search.
+- If the question turns on a *relationship* between two named entities (or \
+  "who else is connected to X"), and a specific entity name is already \
+  confirmed, prefer instructing graph_search on that entity over more text \
+  search -- it may return nothing if the graph hasn't been built for this \
+  corpus, in which case fall back to entity_match/exact_search instead.
+
 Only rely on facts that appear in the evidence log below -- never fabricate \
 names, dates, or numbers that aren't there.
 """
@@ -107,6 +136,12 @@ Available actions (all operate over the same English evidence corpus):
   to 1).
 - entity_match(entity): retrieve chunks that literally mention a specific \
   named entity -- use when you need everything about "that person/place/org."
+- graph_search(entity, hops): traverse a pre-built entity relationship graph \
+  outward from a named entity (1-3 hops) -- use for explicit relationship \
+  questions ("who founded X", "what else did X found", "who else is \
+  connected to X") once you have a specific entity name. Returns nothing if \
+  the graph hasn't been built for this corpus; fall back to entity_match or \
+  exact_search if so.
 - include_docs(doc_ids): pin specific document IDs so they're guaranteed to \
   appear in later retrievals (e.g. a document you've already confirmed is \
   relevant).
@@ -114,6 +149,27 @@ Available actions (all operate over the same English evidence corpus):
   irrelevant or noisy, so later retrievals stop surfacing them.
 - adjust_scale(n): change how many chunks come back per retrieval (smaller \
   once you've narrowed in for precision, larger while still exploring).
+
+When writing the actual query/keywords/entity argument, respect what each \
+action is good at -- do not just restate the Reasoner's full instruction \
+verbatim:
+- semantic_search(query): a short, single-concept natural-language phrase \
+  (roughly 5-15 words). Never concatenate multiple unrelated constraints \
+  (dates, alumni types, distances, etc.) into one query -- that dilutes the \
+  embedding and returns vaguely-related noise instead of a precise match.
+- exact_search(keywords) / entity_match(entity): a short exact phrase, \
+  proper noun, number, or date you expect to appear verbatim in the corpus. \
+  Avoid long descriptive phrases here -- a common word repeated many times \
+  in an unrelated document can outrank a genuinely relevant chunk that only \
+  mentions it once.
+- weighted_fusion(query, w_semantic, w_exact): use for ONE reasonably \
+  specific query when you want to hedge between its literal and conceptual \
+  interpretation -- not as a way to combine several different facts into a \
+  single call.
+
+If the Reasoner's instruction bundles multiple facts together, pick the \
+single most distinctive one to search for now and leave the rest for a \
+later turn.
 """
 
 INTERACT_TOOLS = [
@@ -170,6 +226,21 @@ INTERACT_TOOLS = [
                 "type": "object",
                 "properties": {
                     "entity": {"type": "string", "description": "The entity name to search for, in English."},
+                },
+                "required": ["entity"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "graph_search",
+            "description": "Traverse a pre-built entity relationship graph outward from a named entity, returning nearby entities and how they're connected. Returns nothing if the graph hasn't been built for this corpus.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "entity": {"type": "string", "description": "The entity name to start from, in English."},
+                    "hops": {"type": "integer", "description": "How many relationship hops to traverse outward (1-3), default 1."},
                 },
                 "required": ["entity"],
             },
@@ -255,7 +326,7 @@ REASONER_TOOL = {
 
 # Actions that retrieve evidence (tracked in retrieved_docids); the rest
 # (include_docs/exclude_docs/adjust_scale) only mutate interaction state.
-RETRIEVAL_ACTIONS = {"semantic_search", "exact_search", "weighted_fusion", "entity_match"}
+RETRIEVAL_ACTIONS = {"semantic_search", "exact_search", "weighted_fusion", "entity_match", "graph_search"}
 
 
 def _dispatch(engine: CorpusInteractionEngine, name: str, args: dict) -> tuple[str, list[str]]:
@@ -272,6 +343,8 @@ def _dispatch(engine: CorpusInteractionEngine, name: str, args: dict) -> tuple[s
         )
     elif name == "entity_match":
         hits = engine.entity_match(args.get("entity", ""))
+    elif name == "graph_search":
+        hits = engine.graph_search(args.get("entity", ""), int(args.get("hops", 1) or 1))
     elif name == "include_docs":
         return engine.include_docs(args.get("doc_ids", []) or []), []
     elif name == "exclude_docs":
@@ -320,19 +393,33 @@ class InteractAgent:
         )
 
     # -- the three roles, each its own call/prompt -------------------------
+    #
+    # Each method appends one record to `transcript`: the exact messages sent
+    # and the parsed response, so `--save-transcripts` reproduces precisely
+    # what every role saw and said, independent of the more compact `result`
+    # trace built up in `answer()`.
 
-    def _run_planner(self, question: str) -> str:
+    def _run_planner(self, question: str, transcript: list[dict]) -> str:
+        messages = [
+            {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
+            {"role": "user", "content": question},
+        ]
         response = self.client.chat.completions.create(
             model=config.planner_model,
-            messages=[
-                {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
-                {"role": "user", "content": question},
-            ],
+            messages=messages,
             temperature=config.temperature,
         )
-        return (response.choices[0].message.content or "").strip()
+        plan = (response.choices[0].message.content or "").strip()
+        transcript.append({
+            "role_call": "planner", "turn": 0, "model": config.planner_model,
+            "messages": messages, "response": plan,
+        })
+        return plan
 
-    def _run_reasoner(self, question: str, plan: str, evidence_log: list[dict], force_answer: bool) -> dict:
+    def _run_reasoner(
+        self, question: str, plan: str, evidence_log: list[dict], force_answer: bool,
+        turn: int, transcript: list[dict],
+    ) -> dict:
         user_content = (
             f"Original question (in the source language): {question}\n\n"
             f"Global-Planner's plan:\n{plan}\n\n"
@@ -343,45 +430,56 @@ class InteractAgent:
                 "\nThis is the final allowed turn -- you MUST set decision to "
                 '"ready_to_answer" now, using only the evidence already gathered.'
             )
+        messages = [
+            {"role": "system", "content": REASONER_SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ]
         response = self.client.chat.completions.create(
             model=config.reasoner_model,
-            messages=[
-                {"role": "system", "content": REASONER_SYSTEM_PROMPT},
-                {"role": "user", "content": user_content},
-            ],
+            messages=messages,
             tools=[REASONER_TOOL],
             tool_choice={"type": "function", "function": {"name": "submit_decision"}},
             temperature=config.temperature,
         )
         message = response.choices[0].message
         if not message.tool_calls:
-            return dict(_DEFAULT_DECISION)
-        try:
-            decision = json.loads(message.tool_calls[0].function.arguments or "{}")
-        except json.JSONDecodeError:
             decision = dict(_DEFAULT_DECISION)
-        for key, default in _DEFAULT_DECISION.items():
-            decision.setdefault(key, default)
+        else:
+            try:
+                decision = json.loads(message.tool_calls[0].function.arguments or "{}")
+            except json.JSONDecodeError:
+                decision = dict(_DEFAULT_DECISION)
+            for key, default in _DEFAULT_DECISION.items():
+                decision.setdefault(key, default)
+        transcript.append({
+            "role_call": "reasoner", "turn": turn, "model": config.reasoner_model,
+            "messages": messages, "response": decision,
+        })
         return decision
 
-    def _run_executor(self, strategy: str) -> list[tuple[str, dict]]:
+    def _run_executor(self, strategy: str, turn: int, transcript: list[dict]) -> list[tuple[str, dict]]:
+        messages = [
+            {"role": "system", "content": EXECUTOR_SYSTEM_PROMPT},
+            {"role": "user", "content": f"Adaptive-Reasoner's instruction: {strategy}"},
+        ]
         response = self.client.chat.completions.create(
             model=config.executor_model,
-            messages=[
-                {"role": "system", "content": EXECUTOR_SYSTEM_PROMPT},
-                {"role": "user", "content": f"Adaptive-Reasoner's instruction: {strategy}"},
-            ],
+            messages=messages,
             tools=INTERACT_TOOLS,
             tool_choice="auto",
             temperature=config.temperature,
         )
         message = response.choices[0].message
-        if not message.tool_calls:
-            return []
         calls = []
-        for tool_call in message.tool_calls:
-            args = json.loads(tool_call.function.arguments or "{}")
-            calls.append((tool_call.function.name, args))
+        if message.tool_calls:
+            for tool_call in message.tool_calls:
+                args = json.loads(tool_call.function.arguments or "{}")
+                calls.append((tool_call.function.name, args))
+        transcript.append({
+            "role_call": "executor", "turn": turn, "model": config.executor_model,
+            "messages": messages,
+            "response": [{"name": name, "arguments": args} for name, args in calls],
+        })
         return calls
 
     # -- the episode loop --------------------------------------------------
@@ -392,20 +490,30 @@ class InteractAgent:
         tool_call_counts: dict[str, int] = {}
         result: list[dict] = []
         evidence_log: list[dict] = []
+        transcript: list[dict] = []
         final_answer = ""
 
         _debug(f"=== query {query_id} [{language}]: {query_text!r}")
 
-        plan = self._run_planner(query_text)
+        plan = self._run_planner(query_text, transcript)
         _debug(f"planner plan: {plan[:500]}{'...' if len(plan) > 500 else ''}")
-        result.append({"type": "reasoning", "tool_name": None, "arguments": None, "output": plan, "role": "planner"})
+        result.append({
+            "type": "reasoning", "tool_name": None, "arguments": None,
+            "output": plan, "role": "planner", "model": config.planner_model,
+        })
 
         for turn in range(config.max_turns):
             last_turn = turn == config.max_turns - 1
             _debug(f"--- turn {turn + 1}/{config.max_turns}{' (final, must answer)' if last_turn else ''}")
 
-            decision = self._run_reasoner(query_text, plan, evidence_log, force_answer=last_turn)
-            _debug(f"reasoner decision: {decision['decision']} - {decision.get('rationale', '')[:300]}")
+            decision = self._run_reasoner(
+                query_text, plan, evidence_log, force_answer=last_turn,
+                turn=turn + 1, transcript=transcript,
+            )
+            _debug(
+                f"reasoner decision: {decision['decision']} - {decision.get('rationale', '')[:300]} "
+                f"| strategy: {decision.get('strategy', '')[:300]}"
+            )
             rationale_text = f"[{decision['decision']}] {decision.get('rationale', '')}".strip()
             result.append({
                 "type": "reasoning",
@@ -413,6 +521,8 @@ class InteractAgent:
                 "arguments": None,
                 "output": rationale_text,
                 "role": "reasoner",
+                "model": config.reasoner_model,
+                "decision": decision,  # full structured verdict, including `strategy`
             })
 
             if decision["decision"] == "ready_to_answer" or last_turn:
@@ -426,10 +536,11 @@ class InteractAgent:
                     "arguments": None,
                     "output": final_answer,
                     "role": "reasoner",
+                    "model": config.reasoner_model,
                 })
                 break
 
-            tool_calls = self._run_executor(decision["strategy"])
+            tool_calls = self._run_executor(decision["strategy"], turn=turn + 1, transcript=transcript)
             if not tool_calls:
                 _debug("executor returned no tool calls")
                 result.append({
@@ -438,6 +549,7 @@ class InteractAgent:
                     "arguments": None,
                     "output": "(Executor made no tool call this turn)",
                     "role": "executor",
+                    "model": config.executor_model,
                 })
                 continue
 
@@ -454,6 +566,7 @@ class InteractAgent:
                     "arguments": json.dumps(args, ensure_ascii=False),
                     "output": tool_output,
                     "role": "executor",
+                    "model": config.executor_model,
                 })
 
         return AgentResult(
@@ -462,5 +575,5 @@ class InteractAgent:
             retrieved_docids=retrieved_docids,
             tool_call_counts=tool_call_counts,
             result=result,
-            transcript=evidence_log,
+            transcript=transcript,
         )

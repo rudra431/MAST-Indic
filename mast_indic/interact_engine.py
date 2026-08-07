@@ -6,8 +6,9 @@ can compose turn by turn:
 
 - Multi-faceted retrieval: dense `semantic_search`, sparse `exact_search`,
   and `weighted_fusion` of the two.
-- Anchored matching: `entity_match`, biased toward chunks that literally
-  mention a named entity rather than just paraphrase it.
+- Anchored matching: `entity_match` (literal mentions in chunk text) and
+  `graph_search` (multi-hop traversal of a pre-built entity relationship
+  graph -- see `graph_builder.py`/`entity_graph.py`).
 - Context shaping: `include_docs` / `exclude_docs` pin or filter specific
   documents across subsequent retrievals in the same query, and
   `adjust_scale` changes how many chunks come back.
@@ -32,6 +33,7 @@ from typing import Iterable
 
 import numpy as np
 
+from .entity_graph import EntityGraph
 from .index import SearchHit, SearchIndex, _normalize, embed_texts
 
 
@@ -56,12 +58,15 @@ class CorpusInteractionEngine:
     question to the next.
     """
 
-    def __init__(self, search_index: SearchIndex) -> None:
+    def __init__(self, search_index: SearchIndex, entity_graph: EntityGraph | None = None) -> None:
         self.index = search_index
         self.state = InteractionState()
         self._chunks_by_doc: dict[str, list[int]] = defaultdict(list)
         for i, m in enumerate(self.index.meta):
             self._chunks_by_doc[m["docid"]].append(i)
+        # Lazily loads index_store/relations.jsonl if present; graph_search
+        # simply returns nothing if graph_builder.py hasn't been run yet.
+        self.entity_graph = entity_graph if entity_graph is not None else EntityGraph()
 
     def reset(self) -> None:
         self.state = InteractionState()
@@ -73,13 +78,30 @@ class CorpusInteractionEngine:
         return self.index.matrix @ qvec  # cosine sim, both sides normalized
 
     def _sparse_scores(self, keywords: str) -> np.ndarray:
-        terms = _tokenize(keywords)
+        """Rank by number of *distinct* query terms matched, not raw frequency.
+
+        A plain sum of substring counts lets one repeated common word win
+        outright -- e.g. a dictionary page listing dozens of "bank ___"
+        compound words would outscore a chunk that actually mentions
+        "bank", "CEO", "minister", and "civil servant" once each. Distinct
+        coverage dominates the score here; total occurrence count only
+        breaks ties among chunks that cover the same number of terms.
+        """
+        unique_terms = set(_tokenize(keywords))
         scores = np.zeros(len(self.index.meta), dtype=np.float32)
-        if not terms:
+        if not unique_terms:
             return scores
         for i, m in enumerate(self.index.meta):
             text_lower = m["text"].lower()
-            scores[i] = sum(text_lower.count(t) for t in terms)
+            matched_terms = 0
+            total_count = 0
+            for t in unique_terms:
+                c = text_lower.count(t)
+                if c:
+                    matched_terms += 1
+                    total_count += c
+            if matched_terms:
+                scores[i] = matched_terms + min(total_count, 20) / 1000.0
         peak = scores.max()
         return scores / peak if peak > 0 else scores  # rescale to ~[0, 1] alongside cosine sim
 
@@ -148,6 +170,40 @@ class CorpusInteractionEngine:
         # breaks ties among chunks that mention the entity equally often.
         scores = mention_counts * 1000.0 + self._dense_scores(entity)
         return self._rank(scores)
+
+    def graph_search(self, entity: str, hops: int = 1) -> list[SearchHit]:
+        """Traverse the entity relationship graph outward from `entity`.
+
+        Returns nothing if `graph_builder.py` hasn't been run for this
+        corpus. Results are deduped per source document (richest-in-relations
+        document first, up to `adjust_scale`'s current limit); the snippet is
+        the extracted relation(s) themselves rather than raw chunk text, so
+        the Executor sees *why* a document matched, not just that it did.
+        """
+        if not self.entity_graph.is_built:
+            return []
+        edges = self.entity_graph.neighbors(entity, hops=hops)
+
+        per_doc: dict[str, list[dict]] = defaultdict(list)
+        for edge in edges:
+            if edge["docid"] in self.state.excluded_docids:
+                continue
+            per_doc[edge["docid"]].append(edge)
+
+        ranked_docids = sorted(per_doc, key=lambda d: -len(per_doc[d]))[: self.state.scale]
+
+        hits = []
+        for docid in ranked_docids:
+            doc_edges = per_doc[docid]
+            relation_desc = "; ".join(
+                f'{e["subject"]} {e["relation"]} {e["object"]}' for e in doc_edges[:5]
+            )
+            idxs = self._chunks_by_doc.get(docid, [])
+            chunk_id = doc_edges[0]["chunk_id"]
+            idx = next((i for i in idxs if self.index.meta[i]["chunk_id"] == chunk_id), idxs[0] if idxs else None)
+            url = self.index.meta[idx]["url"] if idx is not None else ""
+            hits.append(SearchHit(docid=docid, url=url, score=float(len(doc_edges)), snippet=relation_desc))
+        return hits
 
     def include_docs(self, doc_ids: Iterable[str]) -> str:
         doc_ids = list(doc_ids)

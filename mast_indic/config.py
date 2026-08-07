@@ -64,6 +64,13 @@ class Config:
     executor_model: str = field(default_factory=lambda: os.environ.get(
         "MAST_EXECUTOR_MODEL", os.environ.get("MAST_CHAT_MODEL", "gpt-4o-mini")))
 
+    # Entity relationship graph (mast_indic/graph_builder.py, used by
+    # CorpusInteractionEngine.graph_search): LLM used to extract
+    # (subject, relation, object) triples per chunk. Defaults to the chat
+    # LLM above; a cheaper/faster model is usually fine for this.
+    graph_model: str = field(default_factory=lambda: os.environ.get(
+        "MAST_GRAPH_MODEL", os.environ.get("MAST_CHAT_MODEL", "gpt-4o-mini")))
+
     # Embeddings: any OpenAI-compatible /v1/embeddings server (Ollama, vLLM, TEI, ...),
     # kept separate from the chat LLM on purpose. Defaults to local Ollama's
     # OpenAI-compat route; point at a vLLM server by setting MAST_EMBED_BASE_URL.

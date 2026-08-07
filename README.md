@@ -15,11 +15,14 @@ mast_indic/
   interact_engine.py # Interact-RAG-style retrieval action primitives (arXiv:2510.27566)
   interact_agent.py  # agent loop using interact_engine.py instead of one `search` tool
   interact_runner.py # CLI: runs interact_agent.py over a language's queries -> submission JSONL
+  graph_builder.py    # CLI: extracts an entity relationship graph from the chunked corpus
+  entity_graph.py     # in-memory adjacency list loaded from graph_builder.py's output
   eval.py            # CLI: LLM-judge scoring of a run against gold answers
 scripts/
   build_index.sh
   run_track2.sh
   run_interact.sh
+  build_entity_graph.sh
 ```
 
 ## Setup
@@ -206,6 +209,8 @@ Interaction actions live in `interact_engine.py`, on top of the same
 - `weighted_fusion(query, w_semantic, w_exact)` — blends the two for one query
 - `entity_match(entity)` — ranks chunks by literal mentions of a named
   entity, dense similarity only breaking ties
+- `graph_search(entity, hops)` — multi-hop traversal of a pre-built entity
+  relationship graph (see below); returns nothing until you build one
 - `include_docs(doc_ids)` / `exclude_docs(doc_ids)` — pin or filter specific
   documents across the rest of that query's retrievals
 - `adjust_scale(n)` — changes how many chunks come back per retrieval
@@ -227,10 +232,33 @@ Python-side plan + evidence log rather than raw chat history:
   answer), translates that instruction into one or more of the action calls
   above (multiple tool calls per turn are supported, same as `agent.py`).
 
+Both the Reasoner and Executor prompts explicitly teach dense-vs-sparse
+retrieval tradeoffs, since naively dumping a whole multi-clause question
+into one query tends to fail either way: dense retrieval averages a long
+sentence into a vague embedding that matches broadly-related-but-wrong
+documents, while sparse retrieval is literal keyword matching, so a common
+word repeated many times in one irrelevant document (e.g. a dictionary
+entry) can outrank a genuinely relevant chunk that only mentions it once.
+The prompts push toward decomposing a multi-constraint question into one
+distinguishing sub-fact per turn, short single-concept queries for
+`semantic_search`, and short exact phrases/names/numbers for
+`exact_search`/`entity_match` rather than descriptive paraphrases.
+
 Each role defaults to `MAST_CHAT_MODEL`, but can be pointed at its own model
 via `MAST_PLANNER_MODEL` / `MAST_REASONER_MODEL` / `MAST_EXECUTOR_MODEL` in
 `.env` (e.g. a cheap model for planning, a stronger one for reasoning) — see
 `config.py`.
+
+**Tracing what each role did:** every step lands in the run JSONL's `result`
+field (always written, no flag needed) tagged with `role`
+(`planner`/`reasoner`/`executor`) and `model`; reasoner steps additionally
+carry the full structured `decision` object (`decision`, `rationale`,
+`strategy`, and -- once ready -- `explanation`/`exact_answer`), so the
+instruction it gave the Executor is never lost. For the exact system/user
+messages sent to and parsed back from each role's API call (full
+request/response reproduction, not just the distilled trace), add
+`--save-transcripts` to get a `transcript` field alongside `result`. Add
+`--debug` to stream the same decisions live to stderr as they happen.
 
 **What this is not:** the paper trains its agent (SFT on synthetic
 trajectories, then GRPO) to use these three roles well. There's no training
@@ -257,16 +285,62 @@ python -m mast_indic.eval \
   --gold data/hi_gold.jsonl
 ```
 
+### Entity relationship graph (`graph_search`)
+
+`graph_search` needs an actual graph built first -- it returns nothing
+until you do. Build one from an already-chunked corpus (`index.py build`
+must have run already, since this reuses `index_store/meta.jsonl` rather
+than re-streaming/re-chunking the raw corpus):
+
+```bash
+./scripts/build_entity_graph.sh --limit 500   # dev-scale subset, a few minutes
+./scripts/build_entity_graph.sh                # full corpus (slow -- one LLM call per chunk)
+```
+
+For each chunk, this asks the chat LLM to extract `(subject, relation,
+object)` triples via a forced structured tool call (so output is always
+valid JSON, never parsed free text), and appends them to
+`index_store/relations.jsonl` with `(docid, chunk_id)` provenance --
+resumable and checkpointed the same way `build_index.sh` is: interrupt and
+rerun with the same command, and it skips chunks already recorded there.
+Override the extraction model with `MAST_GRAPH_MODEL` in `.env` (a
+cheaper/faster model than your main chat model is usually fine here).
+
+`entity_graph.py` loads that file into an in-memory adjacency list, indexed
+in both directions (subject→object and object→subject) so a lookup finds an
+entity regardless of which side of the extracted sentence named it. The
+agent's `graph_search(entity, hops)` action (1-3 hops) BFS-traverses it and
+turns each nearby relation back into a source-chunk hit, deduped per
+document, with the relation itself as the snippet (e.g. `"Lady Shri Ram
+College founded_by Lajjawati Suri"`) rather than raw chunk text -- so the
+Executor sees *why* a document matched.
+
+**This is LLM-based extraction, not a trained NER/relation-extraction
+model** -- consistent with this project's "flat file, brute force,
+dev-scale" approach elsewhere. Expect it to be noisy and non-exhaustive: no
+entity canonicalization is attempted (the same entity phrased two different
+ways across chunks won't merge), relations can be missed, and the model can
+occasionally extract one despite the prompt telling it not to invent facts.
+Treat `graph_search` results as a pointer back to a real chunk worth
+verifying, not as ground truth. If `index_store/relations.jsonl` doesn't
+exist, `graph_search` just returns an empty list and the agent falls back
+to `entity_match`/`exact_search` (both prompts say to do this).
+
 ## What's stubbed vs. real
 
 - **Real**: corpus loading, chunking, batch embedding, cosine search,
   both tool-calling agent loops (single-`search` and Interact-RAG-style),
-  JSONL output, and LLM-judge answer scoring (`mast_indic/eval.py`) —
-  Accuracy, Exact Match, F1, and calibration error.
+  LLM-based entity-relationship graph extraction and multi-hop traversal
+  (`graph_builder.py`/`entity_graph.py`), JSONL output, and LLM-judge answer
+  scoring (`mast_indic/eval.py`) — Accuracy, Exact Match, F1, and
+  calibration error.
 - **Not included**: Interact-RAG's SFT+RL training pipeline — `interact_agent.py`
   is a zero-shot, prompted reproduction of its interaction interface only,
-  not a trained policy (see above). Also not included: retrieval recall and
-  citation precision/recall against qrels — there are no relevance-judgment
-  files for the Indic queries, so `eval.py` only scores final-answer
-  correctness. If real qrels become available, see the BrowseComp-Plus
-  repo's `scripts_evaluation/` for the retrieval-metric approach to port over.
+  not a trained policy (see above). The entity graph is LLM-extracted, not
+  built from a trained NER/relation-extraction model, and has no entity
+  canonicalization (see the graph section above) — treat it as a hint, not
+  ground truth. Also not included: retrieval recall and citation
+  precision/recall against qrels — there are no relevance-judgment files
+  for the Indic queries, so `eval.py` only scores final-answer correctness.
+  If real qrels become available, see the BrowseComp-Plus repo's
+  `scripts_evaluation/` for the retrieval-metric approach to port over.
