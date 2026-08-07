@@ -196,9 +196,8 @@ gives the agent an explicit **Corpus Interaction Engine** of composable
 actions, and a **Global-Planner / Adaptive-Reasoner / Executor** workflow
 for deciding when to use which.
 
-`interact_agent.py` reuses `agent.py`'s tool-calling loop but swaps the one
-`search` tool for that action set, implemented in `interact_engine.py` on
-top of the same `SearchIndex`:
+Interaction actions live in `interact_engine.py`, on top of the same
+`SearchIndex`:
 
 - `semantic_search(query)` — dense embedding retrieval (what `agent.py`'s
   `search` tool does)
@@ -211,17 +210,37 @@ top of the same `SearchIndex`:
   documents across the rest of that query's retrievals
 - `adjust_scale(n)` — changes how many chunks come back per retrieval
 
-The system prompt asks the model to narrate Plan → Proceed-or-Reflect →
-Execute at each turn, and to call one or more of the actions above
-(multiple tool calls per turn are supported, same as `agent.py`).
+Unlike `agent.py` (one system prompt, one model, one growing conversation),
+`interact_agent.py` reproduces the paper's three-module workflow as three
+*separate* LLM calls with distinct prompts and no shared conversation
+thread — each call gets only the context it needs, assembled from a
+Python-side plan + evidence log rather than raw chat history:
+
+- **Global-Planner** — one call per query, decomposes the question into a
+  numbered plan. Plain text, no tools.
+- **Adaptive-Reasoner** — one call per turn. Given the plan and the evidence
+  gathered so far, it must call a forced `submit_decision` function
+  returning `proceed` / `reflect_refine` / `ready_to_answer` plus a
+  `strategy` instruction for the Executor (or, once ready, the final
+  `explanation`/`exact_answer`). Structured output, not parsed free text.
+- **Executor** — one call per turn (skipped once the Reasoner is ready to
+  answer), translates that instruction into one or more of the action calls
+  above (multiple tool calls per turn are supported, same as `agent.py`).
+
+Each role defaults to `MAST_CHAT_MODEL`, but can be pointed at its own model
+via `MAST_PLANNER_MODEL` / `MAST_REASONER_MODEL` / `MAST_EXECUTOR_MODEL` in
+`.env` (e.g. a cheap model for planning, a stronger one for reasoning) — see
+`config.py`.
 
 **What this is not:** the paper trains its agent (SFT on synthetic
-trajectories, then GRPO) to use these actions well. There's no training
+trajectories, then GRPO) to use these three roles well. There's no training
 pipeline here — `interact_agent.py` is a zero-shot, prompted reproduction of
-just the *interaction interface*, relying on the chat model's own tool-use
-ability rather than a fine-tuned policy. Whether it beats the plain
-single-`search` agent depends entirely on how well your `MAST_CHAT_MODEL`
-follows the richer instructions zero-shot.
+just the *interaction interface and module split*, relying on the chat
+model's own instruction-following rather than a fine-tuned policy. Whether
+it beats the plain single-`search` agent (or a single-prompt version of this
+same workflow) depends entirely on how well your chosen model(s) follow
+these narrower, more structured prompts zero-shot — and it costs roughly
+2-3x the LLM calls per turn to find out.
 
 ```bash
 ./scripts/run_interact.sh --language hi --limit 5   # smoke test

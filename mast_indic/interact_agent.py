@@ -4,15 +4,35 @@ Where `agent.py` gives the LLM one black-box `search` tool, this agent
 exposes the paper's fine-grained Corpus Interaction Engine actions
 (`mast_indic/interact_engine.py`): dense/sparse/fused retrieval,
 entity-anchored matching, and context shaping (pin/filter documents, resize
-result sets). The system prompt below asks the model to reproduce the
-paper's Global-Planner / Adaptive-Reasoner / Executor workflow zero-shot,
-inside a single conversation, rather than via the paper's trained
-SFT+RL policy -- there's no training pipeline here, just the prompted
-interaction interface plus this project's existing tool-calling loop.
+result sets). It also reproduces the paper's *three-module* workflow as
+three separate LLM calls with distinct prompts, rather than one agent
+narrating all three roles in a single call:
+
+- Global-Planner: one call per query, decomposes the question into a plan.
+- Adaptive-Reasoner: one call per turn, judges the evidence gathered so far
+  and either directs the Executor (proceed / reflect & refine) or ends the
+  episode with a final answer. Returns a structured decision (forced
+  function call) rather than free text, so the loop doesn't have to parse
+  natural-language verdicts.
+- Executor: one call per turn (only when the Reasoner isn't done yet),
+  translates the Reasoner's instruction into one or more concrete calls to
+  the interaction primitives.
+
+Each role can optionally run on its own model (`MAST_PLANNER_MODEL` /
+`MAST_REASONER_MODEL` / `MAST_EXECUTOR_MODEL` in `config.py`); all three
+default to `MAST_CHAT_MODEL` if unset, so nothing changes unless you split
+them out.
+
+This is a zero-shot, prompted reproduction of the paper's *interaction
+interface and module split* -- there's no SFT+RL training pipeline here,
+just three prompted roles driving the same tool-calling machinery this
+project already uses elsewhere.
 
 Output record shape matches `agent.py`/`runner.py` exactly (reusing
 `AgentResult`), so runs from this agent drop straight into
-`mast_indic/eval.py` unchanged.
+`mast_indic/eval.py` unchanged. Each `result` trace entry also carries a
+`role` field (`planner`/`reasoner`/`executor`) for debugging -- `eval.py`
+ignores it.
 """
 from __future__ import annotations
 
@@ -32,30 +52,52 @@ def _debug(msg: str) -> None:
         print(f"[debug] {msg}", file=sys.stderr, flush=True)
 
 
-SYSTEM_PROMPT = """You are a multilingual research agent for the MAST @ FIRE 2026 \
-benchmark (Track 2: Indic), using an Interact-RAG-style corpus interaction \
-interface instead of a single black-box search tool. You will receive a \
-complex question written in an Indian language. The evidence corpus is \
-entirely in English, and your final answer must also be in English.
+PLANNER_SYSTEM_PROMPT = """You are the Global-Planner in an Interact-RAG-style \
+research pipeline (MAST @ FIRE 2026, Track 2: Indic). You will be given a \
+complex question written in an Indian language; the evidence corpus and the \
+eventual answer are in English.
 
-You act out three roles internally, in order, at every step:
+Read the question and decompose it into a short, numbered plan of the \
+sub-questions/facts an evidence-gathering agent will need to resolve, in the \
+order they're likely needed (e.g. resolve an entity first, then a date, then \
+the final fact). Do not answer the question yourself and do not invent facts \
+-- you have no access to the evidence corpus. Output ONLY the numbered plan, \
+nothing else.
+"""
 
-1. Global-Planner (first turn only): read the question and write a short, \
-   numbered plan of the sub-questions you need evidence for.
-2. Adaptive-Reasoner (every turn): look at the evidence gathered so far and \
-   decide one of:
-   - Proceed: the current sub-task has enough evidence -- move to the next \
-     one, or answer if all sub-questions are resolved.
-   - Reflect & Refine: evidence is missing, contradictory, or the last \
-     action(s) came back empty/irrelevant. Diagnose why and change strategy \
-     (a different action, different keywords, a narrower/wider scale, \
-     excluding a noisy document, etc.) rather than repeating the same call.
-   State which of the two applies in one short line before acting.
-3. Executor: call one or more of the tools below to carry out that \
-   decision. You may call several tools in the same turn when they serve \
-   independent sub-questions.
+REASONER_SYSTEM_PROMPT = """You are the Adaptive-Reasoner in the same \
+Interact-RAG-style pipeline. You are the cognitive core: given the original \
+question, the Global-Planner's plan, and all evidence gathered so far by the \
+Executor, you decide what happens next by calling `submit_decision`:
 
-Available actions (all operate over the same evidence corpus):
+- decision="proceed": the current sub-task from the plan is progressing well \
+  and there's enough evidence to move to the next sub-task. Set `strategy` \
+  to a concrete instruction for the Executor -- which action to use and with \
+  what query/entity/keywords.
+- decision="reflect_refine": the process hit an obstacle -- the last \
+  action(s) returned nothing useful, evidence is contradictory, or the \
+  context is cluttered with irrelevant documents. Diagnose the obstacle in \
+  `rationale`, and set `strategy` to a *different* concrete instruction (a \
+  different action, different keywords, a broader/narrower scale, or \
+  excluding a noisy document) -- never repeat a failing action verbatim.
+- decision="ready_to_answer": every sub-question in the plan is resolved by \
+  evidence that was actually retrieved. Leave `strategy` empty and instead \
+  fill in `explanation` (one or two sentences citing what was found) and \
+  `exact_answer` (the short factual answer alone, e.g. "Marie Curie" or \
+  "1912").
+
+Only rely on facts that appear in the evidence log below -- never fabricate \
+names, dates, or numbers that aren't there.
+"""
+
+EXECUTOR_SYSTEM_PROMPT = """You are the Executor in the same Interact-RAG-style \
+pipeline. You do not decide strategy -- the Adaptive-Reasoner already has. \
+Your only job is to translate its instruction into one or more concrete \
+calls to the interaction primitives below. Call at least one tool every \
+time; call more than one in the same turn only if the instruction genuinely \
+calls for independent lookups.
+
+Available actions (all operate over the same English evidence corpus):
 - semantic_search(query): dense embedding retrieval -- good for \
   paraphrased/conceptual matches.
 - exact_search(keywords): sparse exact-keyword retrieval -- good for names, \
@@ -72,14 +114,6 @@ Available actions (all operate over the same evidence corpus):
   irrelevant or noisy, so later retrievals stop surfacing them.
 - adjust_scale(n): change how many chunks come back per retrieval (smaller \
   once you've narrowed in for precision, larger while still exploring).
-
-Only rely on facts you found via these actions -- do not use outside \
-knowledge to fabricate specifics (names, dates, numbers). When you have \
-enough evidence, stop calling tools and give your final answer.
-
-Final answer format -- respond with exactly two lines:
-Explanation: <one or two sentences citing what you found>
-Exact Answer: <the short factual answer alone, e.g. "Marie Curie" or "1912">
 """
 
 INTERACT_TOOLS = [
@@ -185,6 +219,40 @@ INTERACT_TOOLS = [
     },
 ]
 
+REASONER_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "submit_decision",
+        "description": "Report the Adaptive-Reasoner's judgment of the current state and what should happen next.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "decision": {
+                    "type": "string",
+                    "enum": ["proceed", "reflect_refine", "ready_to_answer"],
+                },
+                "rationale": {
+                    "type": "string",
+                    "description": "One or two sentences on why the evidence is/isn't sufficient right now.",
+                },
+                "strategy": {
+                    "type": "string",
+                    "description": "If proceed/reflect_refine: a concrete instruction for the Executor. Leave empty if ready_to_answer.",
+                },
+                "explanation": {
+                    "type": "string",
+                    "description": "Required if decision is ready_to_answer: one or two sentences citing the evidence found.",
+                },
+                "exact_answer": {
+                    "type": "string",
+                    "description": "Required if decision is ready_to_answer: the short factual final answer alone.",
+                },
+            },
+            "required": ["decision", "rationale", "strategy"],
+        },
+    },
+}
+
 # Actions that retrieve evidence (tracked in retrieved_docids); the rest
 # (include_docs/exclude_docs/adjust_scale) only mutate interaction state.
 RETRIEVAL_ACTIONS = {"semantic_search", "exact_search", "weighted_fusion", "entity_match"}
@@ -221,6 +289,25 @@ def _dispatch(engine: CorpusInteractionEngine, name: str, args: dict) -> tuple[s
     return json.dumps(payload, ensure_ascii=False), docids
 
 
+def _format_evidence(evidence_log: list[dict]) -> str:
+    if not evidence_log:
+        return "(no evidence gathered yet)"
+    lines = []
+    for entry in evidence_log:
+        lines.append(f"[Turn {entry['turn']}] {entry['action']}({entry['args']}):")
+        lines.append(entry["output"])
+    return "\n".join(lines)
+
+
+_DEFAULT_DECISION = {
+    "decision": "reflect_refine",
+    "rationale": "",
+    "strategy": "Broaden the search on the original question.",
+    "explanation": None,
+    "exact_answer": None,
+}
+
+
 class InteractAgent:
     def __init__(self, search_index: SearchIndex | None = None) -> None:
         self.index = search_index or SearchIndex()
@@ -232,82 +319,141 @@ class InteractAgent:
             max_retries=config.request_max_retries,
         )
 
+    # -- the three roles, each its own call/prompt -------------------------
+
+    def _run_planner(self, question: str) -> str:
+        response = self.client.chat.completions.create(
+            model=config.planner_model,
+            messages=[
+                {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
+                {"role": "user", "content": question},
+            ],
+            temperature=config.temperature,
+        )
+        return (response.choices[0].message.content or "").strip()
+
+    def _run_reasoner(self, question: str, plan: str, evidence_log: list[dict], force_answer: bool) -> dict:
+        user_content = (
+            f"Original question (in the source language): {question}\n\n"
+            f"Global-Planner's plan:\n{plan}\n\n"
+            f"Evidence gathered so far:\n{_format_evidence(evidence_log)}\n"
+        )
+        if force_answer:
+            user_content += (
+                "\nThis is the final allowed turn -- you MUST set decision to "
+                '"ready_to_answer" now, using only the evidence already gathered.'
+            )
+        response = self.client.chat.completions.create(
+            model=config.reasoner_model,
+            messages=[
+                {"role": "system", "content": REASONER_SYSTEM_PROMPT},
+                {"role": "user", "content": user_content},
+            ],
+            tools=[REASONER_TOOL],
+            tool_choice={"type": "function", "function": {"name": "submit_decision"}},
+            temperature=config.temperature,
+        )
+        message = response.choices[0].message
+        if not message.tool_calls:
+            return dict(_DEFAULT_DECISION)
+        try:
+            decision = json.loads(message.tool_calls[0].function.arguments or "{}")
+        except json.JSONDecodeError:
+            decision = dict(_DEFAULT_DECISION)
+        for key, default in _DEFAULT_DECISION.items():
+            decision.setdefault(key, default)
+        return decision
+
+    def _run_executor(self, strategy: str) -> list[tuple[str, dict]]:
+        response = self.client.chat.completions.create(
+            model=config.executor_model,
+            messages=[
+                {"role": "system", "content": EXECUTOR_SYSTEM_PROMPT},
+                {"role": "user", "content": f"Adaptive-Reasoner's instruction: {strategy}"},
+            ],
+            tools=INTERACT_TOOLS,
+            tool_choice="auto",
+            temperature=config.temperature,
+        )
+        message = response.choices[0].message
+        if not message.tool_calls:
+            return []
+        calls = []
+        for tool_call in message.tool_calls:
+            args = json.loads(tool_call.function.arguments or "{}")
+            calls.append((tool_call.function.name, args))
+        return calls
+
+    # -- the episode loop --------------------------------------------------
+
     def answer(self, query_id: str, query_text: str, language: str = "") -> AgentResult:
         self.engine.reset()
-        messages: list[dict] = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": query_text},
-        ]
         retrieved_docids: list[list[str]] = []
         tool_call_counts: dict[str, int] = {}
         result: list[dict] = []
+        evidence_log: list[dict] = []
         final_answer = ""
 
         _debug(f"=== query {query_id} [{language}]: {query_text!r}")
 
+        plan = self._run_planner(query_text)
+        _debug(f"planner plan: {plan[:500]}{'...' if len(plan) > 500 else ''}")
+        result.append({"type": "reasoning", "tool_name": None, "arguments": None, "output": plan, "role": "planner"})
+
         for turn in range(config.max_turns):
             last_turn = turn == config.max_turns - 1
-            _debug(f"--- turn {turn + 1}/{config.max_turns}{' (final, tools disabled)' if last_turn else ''}")
-            if last_turn:
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        "You have used all available turns and cannot call any "
-                        "more tools. Based only on the evidence already "
-                        "gathered, respond now in exactly this format:\n"
-                        "Explanation: <one or two sentences citing what you found>\n"
-                        "Exact Answer: <the short factual answer alone>"
-                    ),
-                })
-            response = self.client.chat.completions.create(
-                model=config.chat_model,
-                messages=messages,
-                tools=INTERACT_TOOLS,
-                tool_choice="none" if last_turn else "auto",
-                temperature=config.temperature,
-            )
-            message = response.choices[0].message
-            messages.append(message.model_dump(exclude_none=True))
+            _debug(f"--- turn {turn + 1}/{config.max_turns}{' (final, must answer)' if last_turn else ''}")
 
-            reasoning = getattr(message, "reasoning", None) or getattr(message, "reasoning_content", None)
-            if reasoning:
-                _debug(f"reasoning: {reasoning[:500]}{'...' if len(reasoning) > 500 else ''}")
-                result.append({"type": "reasoning", "tool_name": None, "arguments": None, "output": reasoning})
-            elif message.content and message.tool_calls:
-                # Planner/Reasoner narration often lands in `content` alongside
-                # tool calls rather than in a separate reasoning field.
-                _debug(f"reasoning: {message.content[:500]}{'...' if len(message.content) > 500 else ''}")
+            decision = self._run_reasoner(query_text, plan, evidence_log, force_answer=last_turn)
+            _debug(f"reasoner decision: {decision['decision']} - {decision.get('rationale', '')[:300]}")
+            rationale_text = f"[{decision['decision']}] {decision.get('rationale', '')}".strip()
+            result.append({
+                "type": "reasoning",
+                "tool_name": None,
+                "arguments": None,
+                "output": rationale_text,
+                "role": "reasoner",
+            })
+
+            if decision["decision"] == "ready_to_answer" or last_turn:
+                explanation = decision.get("explanation") or "insufficient evidence gathered"
+                exact_answer = decision.get("exact_answer") or "Not found in evidence"
+                final_answer = f"Explanation: {explanation}\nExact Answer: {exact_answer}"
+                _debug(f"final answer: {final_answer!r}")
+                result.append({
+                    "type": "output_text",
+                    "tool_name": None,
+                    "arguments": None,
+                    "output": final_answer,
+                    "role": "reasoner",
+                })
+                break
+
+            tool_calls = self._run_executor(decision["strategy"])
+            if not tool_calls:
+                _debug("executor returned no tool calls")
                 result.append({
                     "type": "reasoning",
                     "tool_name": None,
                     "arguments": None,
-                    "output": message.content.strip(),
+                    "output": "(Executor made no tool call this turn)",
+                    "role": "executor",
                 })
+                continue
 
-            if not message.tool_calls:
-                final_answer = (message.content or "").strip()
-                _debug(f"final answer: {final_answer!r}")
-                result.append({"type": "output_text", "tool_name": None, "arguments": None, "output": final_answer})
-                break
-
-            for tool_call in message.tool_calls:
-                name = tool_call.function.name
-                args = json.loads(tool_call.function.arguments or "{}")
+            for name, args in tool_calls:
                 tool_call_counts[name] = tool_call_counts.get(name, 0) + 1
                 tool_output, docids = _dispatch(self.engine, name, args)
                 if name in RETRIEVAL_ACTIONS:
                     retrieved_docids.append(docids)
-                _debug(f"{name}({args}) -> {tool_output[:300]}{'...' if len(tool_output) > 300 else ''}")
+                evidence_log.append({"turn": turn + 1, "action": name, "args": args, "output": tool_output})
+                _debug(f"executor {name}({args}) -> {tool_output[:300]}{'...' if len(tool_output) > 300 else ''}")
                 result.append({
                     "type": "tool_call",
                     "tool_name": name,
                     "arguments": json.dumps(args, ensure_ascii=False),
                     "output": tool_output,
-                })
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": tool_output,
+                    "role": "executor",
                 })
 
         return AgentResult(
@@ -316,5 +462,5 @@ class InteractAgent:
             retrieved_docids=retrieved_docids,
             tool_call_counts=tool_call_counts,
             result=result,
-            transcript=messages,
+            transcript=evidence_log,
         )
