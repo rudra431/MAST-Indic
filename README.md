@@ -10,8 +10,10 @@ mast_indic/
   config.py          # env-driven settings
   index.py           # build/query the local embedding index (OpenAI-compatible embeddings)
   queries.py         # loads indic-queries-2026 per language
-  agent.py           # tool-calling agent loop, one `search` tool (OpenAI-compatible client)
+  agent.py           # tool-calling agent loop, one dense `search` tool (OpenAI-compatible client)
   runner.py          # CLI: runs agent.py over a language's queries -> submission JSONL
+  exact_agent.py      # same loop as agent.py, but one sparse/exact-keyword `search` tool
+  exact_runner.py     # CLI: runs exact_agent.py over a language's queries -> submission JSONL
   interact_engine.py # Interact-RAG-style retrieval action primitives (arXiv:2510.27566)
   interact_agent.py  # agent loop using interact_engine.py instead of one `search` tool
   interact_runner.py # CLI: runs interact_agent.py over a language's queries -> submission JSONL
@@ -21,6 +23,7 @@ mast_indic/
 scripts/
   build_index.sh
   run_track2.sh
+  run_exact.sh
   run_interact.sh
   build_entity_graph.sh
 ```
@@ -190,6 +193,46 @@ query directly and formulate English search queries themselves. If you find a
 particular language/model combination struggles with this, consider adding an
 explicit translate-then-search step in `agent.py`.
 
+## Alternative agent: exact-search-only baseline (`mast_indic/exact_agent.py`)
+
+Same loop as `agent.py` above -- one system prompt, one `search` tool, one
+growing conversation -- but the tool is backed by
+`CorpusInteractionEngine.exact_search` (sparse, distinct-term-coverage
+keyword matching) instead of `SearchIndex.search`'s dense cosine similarity.
+No other tools, no dense retrieval fallback, and (since exact-search never
+calls the embedding server) no embedding calls at runtime at all -- `index.py
+build` still needs to have been run once, though, since this searches over
+the same `index_store/meta.jsonl` chunk text.
+
+The system prompt is adjusted to match: it tells the model this tool only
+does literal keyword matching, so it should write short specific
+keywords/names/phrases rather than paraphrased natural-language questions.
+
+**Planning step:** before the search loop starts, a separate LLM call
+(mirroring `interact_agent.py`'s Global-Planner, sharing its
+`MAST_PLANNER_MODEL` config) decomposes the question into a list of ATOMIC
+sub-queries -- short keyword-style phrases, one per distinguishing fact
+(e.g. `"founded 1949 1959"`, `"Lady Shri Ram College"`), not the kind of
+broader sub-questions a general planner would produce, since exact_search
+specifically needs something already shaped like a usable keyword query.
+The plan is logged in `result` (tagged `role: "planner"`) and injected into
+the conversation as context for the model to use as a starting point -- it's
+not a tool the model calls, and the search loop that follows is otherwise
+identical to `agent.py`'s: one tool, no forced ordering through the plan.
+
+This exists as a sparse-only counterpart to `agent.py`'s dense-only
+baseline, so you can compare dense-only vs. sparse-only vs. the full
+multi-tool `interact_agent.py` on the same queries:
+
+```bash
+./scripts/run_exact.sh --language hi --limit 5   # smoke test
+./scripts/run_exact.sh --language hi              # full Hindi run
+```
+
+Writes `runs/{MAST_CHAT_MODEL}/exact_{language}.jsonl` -- same record shape
+as the other two agents (`retriever` is tagged `exact-search`), so it
+evaluates with `eval.py` unchanged.
+
 ## Alternative agent: Interact-RAG-style interaction (`mast_indic/interact_agent.py`)
 
 [Interact-RAG (arXiv:2510.27566)](https://arxiv.org/abs/2510.27566) argues
@@ -221,16 +264,37 @@ Unlike `agent.py` (one system prompt, one model, one growing conversation),
 thread — each call gets only the context it needs, assembled from a
 Python-side plan + evidence log rather than raw chat history:
 
-- **Global-Planner** — one call per query, decomposes the question into a
-  numbered plan. Plain text, no tools.
-- **Adaptive-Reasoner** — one call per turn. Given the plan and the evidence
-  gathered so far, it must call a forced `submit_decision` function
-  returning `proceed` / `reflect_refine` / `ready_to_answer` plus a
-  `strategy` instruction for the Executor (or, once ready, the final
-  `explanation`/`exact_answer`). Structured output, not parsed free text.
-- **Executor** — one call per turn (skipped once the Reasoner is ready to
-  answer), translates that instruction into one or more of the action calls
-  above (multiple tool calls per turn are supported, same as `agent.py`).
+- **Global-Planner** — one call per query. Plain text, no tools; the prompt
+  follows Interact-RAG's actual published planner prompt: a single
+  comprehensive query for direct questions, decomposition into simple
+  sub-tasks (further subdivided if not simple enough) for complex ones,
+  flagging sub-tasks that don't depend on each other and can run in
+  parallel, and no answering or inventing facts itself. Output is free-text
+  reasoning followed by a `Primary Plan:` numbered list, passed to the
+  Reasoner as-is (not parsed).
+- **Adaptive-Reasoner** — one call per turn, also free text: Interact-RAG's
+  actual published reasoner prompt. Summarizes findings so far, then chooses
+  one of three paths -- A) Proceed (propose the next search, up to two in
+  parallel), B) Conclude (announce completion, summarize key findings), C)
+  Reflect & Refine (diagnose why the last search failed, propose a different
+  one; after 3 failed attempts on one sub-task, move on). This is advisory
+  analysis only, not a control-flow gate -- **the Reasoner never ends the
+  episode itself**, matching the paper. Which path it narrated is recovered
+  by regex purely for trace/debug purposes (`_parse_reasoner_response`).
+- **Executor** — one call *every* turn, also Interact-RAG's actual published
+  prompt. Given the original question plus the Reasoner's analysis, it alone
+  decides each turn whether to call up to 2 of the action calls above, or
+  formulate the final answer instead -- matching the paper's actual control
+  flow, where the Executor (not the Reasoner) is the one that concludes.
+  The one deliberate deviation from the paper: its Executor's final answer
+  is just "concise and direct words," but ours must end with fixed
+  `Explanation:`/`Exact Answer:` lines, since `eval.py` depends on that
+  format to score answers (`_ensure_final_answer_format` wraps whatever the
+  model actually said if it didn't comply). Termination is still guaranteed:
+  on the last allowed turn the Executor's `tool_choice` is forced to
+  `"none"` (same trick `agent.py` uses), and if a non-compliant server
+  somehow searches anyway on that turn, a fallback answer still gets
+  appended rather than ending with no answer at all.
 
 Both the Reasoner and Executor prompts explicitly teach dense-vs-sparse
 retrieval tradeoffs, since naively dumping a whole multi-clause question
@@ -252,11 +316,11 @@ via `MAST_PLANNER_MODEL` / `MAST_REASONER_MODEL` / `MAST_EXECUTOR_MODEL` in
 **Tracing what each role did:** every step lands in the run JSONL's `result`
 field (always written, no flag needed) tagged with `role`
 (`planner`/`reasoner`/`executor`) and `model`; reasoner steps additionally
-carry the full structured `decision` object (`decision`, `rationale`,
-`strategy`, and -- once ready -- `explanation`/`exact_answer`), so the
-instruction it gave the Executor is never lost. For the exact system/user
-messages sent to and parsed back from each role's API call (full
-request/response reproduction, not just the distilled trace), add
+carry the parsed `decision` object (`decision` and the full free-text
+`analysis`), so the analysis that drove the Executor is never lost even
+though it was never a structured field to begin with. For the exact
+system/user messages sent to and parsed back from each role's API call
+(full request/response reproduction, not just the distilled trace), add
 `--save-transcripts` to get a `transcript` field alongside `result`. Add
 `--debug` to stream the same decisions live to stderr as they happen.
 
@@ -300,11 +364,24 @@ than re-streaming/re-chunking the raw corpus):
 For each chunk, this asks the chat LLM to extract `(subject, relation,
 object)` triples via a forced structured tool call (so output is always
 valid JSON, never parsed free text), and appends them to
-`index_store/relations.jsonl` with `(docid, chunk_id)` provenance --
-resumable and checkpointed the same way `build_index.sh` is: interrupt and
-rerun with the same command, and it skips chunks already recorded there.
-Override the extraction model with `MAST_GRAPH_MODEL` in `.env` (a
-cheaper/faster model than your main chat model is usually fine here).
+`index_store/relations.jsonl` with `(docid, chunk_id)` provenance.
+Completion is tracked per chunk in a separate `index_store/relations_progress.jsonl`
+sidecar file (not by presence in `relations.jsonl` itself, since a chunk
+with genuinely zero relations would otherwise look "not yet processed"
+forever) -- resumable the same way `build_index.sh` is: interrupt and rerun
+with the same command, and it skips chunks already recorded there; pass
+`--fresh` to ignore both files and rebuild from scratch. Override the
+extraction model with `MAST_GRAPH_MODEL` in `.env` (a cheaper/faster model
+than your main chat model is usually fine here).
+
+Chunks longer than `--max-chunk-chars` (default 1500; rarely triggered at
+this project's default `MAST_CHUNK_WORDS=220`, but relevant for
+`index.py`'s whitespace-less-text backstop or a larger configured chunk
+size) are split into smaller, slightly-overlapping windows before
+extraction rather than sent whole -- a single long wall of text both risks
+slow/timeout-prone LLM calls and tends to yield fewer, lower-quality
+relations than the same text extracted from focused passages. All windows
+of one chunk still count as a single unit of work for progress tracking.
 
 `entity_graph.py` loads that file into an in-memory adjacency list, indexed
 in both directions (subject→object and object→subject) so a lookup finds an
@@ -329,9 +406,9 @@ to `entity_match`/`exact_search` (both prompts say to do this).
 ## What's stubbed vs. real
 
 - **Real**: corpus loading, chunking, batch embedding, cosine search,
-  both tool-calling agent loops (single-`search` and Interact-RAG-style),
-  LLM-based entity-relationship graph extraction and multi-hop traversal
-  (`graph_builder.py`/`entity_graph.py`), JSONL output, and LLM-judge answer
+  all three tool-calling agent loops (dense-only, sparse-only, and
+  Interact-RAG-style), LLM-based entity-relationship graph extraction and
+  multi-hop traversal (`graph_builder.py`/`entity_graph.py`), JSONL output, and LLM-judge answer
   scoring (`mast_indic/eval.py`) — Accuracy, Exact Match, F1, and
   calibration error.
 - **Not included**: Interact-RAG's SFT+RL training pipeline — `interact_agent.py`

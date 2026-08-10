@@ -33,7 +33,7 @@ def iter_corpus(limit: int | None = None) -> Iterator[dict]:
     from datasets import load_dataset
 
     ds = load_dataset(config.corpus_dataset, split="train", streaming=limit is not None)
-    for i, row in enumerate(ds):
+    for i, row in tqdm(enumerate(ds)):
         if limit is not None and i >= limit:
             break
         yield {"docid": str(row["docid"]), "text": row["text"], "url": row.get("url", "")}
