@@ -19,6 +19,7 @@ mast_indic/
   interact_runner.py # CLI: runs interact_agent.py over a language's queries -> submission JSONL
   graph_builder.py    # CLI: extracts an entity relationship graph from the chunked corpus
   entity_graph.py     # in-memory adjacency list loaded from graph_builder.py's output
+  export_corpus.py    # CLI: dumps each corpus document as its own Markdown file
   eval.py            # CLI: LLM-judge scoring of a run against gold answers
 scripts/
   build_index.sh
@@ -26,6 +27,7 @@ scripts/
   run_exact.sh
   run_interact.sh
   build_entity_graph.sh
+  export_corpus.sh
 ```
 
 ## Setup
@@ -80,6 +82,21 @@ run indexing against a GPU-backed embedding server (e.g. vLLM), or swap
 Qwen3-Embedding indexes
 (see `scripts_build_index/download_indexes.sh` in
 [texttron/BrowseComp-Plus](https://github.com/texttron/BrowseComp-Plus)).
+
+**Browsing the raw corpus:** `export_corpus.py` dumps each document as its
+own `.md` file, independent of the embedding index -- no API keys, no LLM,
+just streams `MAST_CORPUS_DATASET` and writes `{docid}.md` (title, source
+URL if present, then the full text) into an output directory:
+
+```bash
+./scripts/export_corpus.sh --limit 200                        # dev-scale subset
+./scripts/export_corpus.sh --output-dir corpus_markdown        # full corpus (many files)
+```
+
+Resumable by default (skips a docid whose `.md` file already exists); pass
+`--fresh` to re-export everything. Useful for manually checking what a
+document actually says when a search result looks off -- grep/open the file
+directly rather than only ever seeing a truncated snippet.
 
 ## 2. Run the agent
 
@@ -247,9 +264,16 @@ Interaction actions live in `interact_engine.py`, on top of the same
 
 - `semantic_search(query)` — dense embedding retrieval (what `agent.py`'s
   `search` tool does)
-- `exact_search(keywords)` — sparse, case-insensitive keyword-count
-  retrieval (a lightweight stand-in for BM25 — see the module docstring)
-- `weighted_fusion(query, w_semantic, w_exact)` — blends the two for one query
+- `exact_search(keywords)` — sparse retrieval, real Okapi BM25 over an
+  in-memory inverted index built once per engine instance (term-frequency
+  saturation + document-length normalization + IDF — see the module
+  docstring for why that matters over a naive keyword-count)
+- `boolean_search(and_terms, or_terms, not_terms)` — exact AND/OR/NOT set
+  retrieval over the same inverted index, with **no ranking**: every match
+  is equally valid. For when you need strict logical control rather than a
+  best-guess ranking
+- `weighted_fusion(query, w_semantic, w_exact)` — blends dense with BM25
+  for one query
 - `entity_match(entity)` — ranks chunks by literal mentions of a named
   entity, dense similarity only breaking ties
 - `graph_search(entity, hops)` — multi-hop traversal of a pre-built entity
@@ -308,6 +332,19 @@ distinguishing sub-fact per turn, short single-concept queries for
 `semantic_search`, and short exact phrases/names/numbers for
 `exact_search`/`entity_match` rather than descriptive paraphrases.
 
+**Bounded evidence context:** every turn's search results get appended to
+an evidence log that's restated to the Reasoner on the *next* turn so it
+can judge what's been found so far. Restating the full history unbounded
+would grow with turn count and can overflow the model's context window on
+a long-running query -- or even from a single oversized `adjust_scale` call
+(up to 50 chunks x ~400-word snippets is ~26k tokens by itself). Past
+`MAST_EVIDENCE_CHAR_BUDGET` (default 60000 characters), older rounds are
+dropped first (noted as `"N earlier search round(s) omitted"`); a single
+round that alone exceeds the budget is hard-truncated rather than dropped,
+so the Reasoner always sees at least the most recent result. This only
+bounds what's sent to the LLM -- the full evidence still ends up in the
+run's own `result`/`transcript` trace.
+
 Each role defaults to `MAST_CHAT_MODEL`, but can be pointed at its own model
 via `MAST_PLANNER_MODEL` / `MAST_REASONER_MODEL` / `MAST_EXECUTOR_MODEL` in
 `.env` (e.g. a cheap model for planning, a stronger one for reasoning) — see
@@ -323,6 +360,14 @@ system/user messages sent to and parsed back from each role's API call
 (full request/response reproduction, not just the distilled trace), add
 `--save-transcripts` to get a `transcript` field alongside `result`. Add
 `--debug` to stream the same decisions live to stderr as they happen.
+
+**Visualizing a run:** open `tools/trace_viewer.html` directly in a browser
+(no server, no build step) and drop a run JSONL onto it to interactively
+walk through each query's Planner → Reasoner → Executor turns -- decisions,
+search results with scores/snippets, and the final answer, all rendered
+turn by turn. Nothing leaves the browser; it reads the file locally via the
+File API. Passing `--save-transcripts` when generating the run lets it also
+show the original question text inline.
 
 **What this is not:** the paper trains its agent (SFT on synthetic
 trajectories, then GRPO) to use these three roles well. There's no training

@@ -119,12 +119,14 @@ B) Conclude: choose this if the whole question is resolved and you have sufficie
 C) Reflect & Refine: choose this if the previous search was ineffective (irrelevant, \
    incomplete, or low-quality results). First, briefly explain why the search failed. \
    Then propose a refined search action with improved parameters -- account for how \
-   the retrieval modes actually behave (dense/semantic_search embeds the whole query \
+   the retrieval modes actually behave: dense/semantic_search embeds the whole query \
    into one vector, so a long sentence chaining unrelated constraints together dilutes \
    into a vague, often-wrong match; sparse/exact_search and entity_match are literal \
-   keyword matching, good for a name/number/exact phrase but easily dominated by an \
-   unrelated document that happens to repeat one common word many times). If a \
-   sub-task remains unresolved after 3 attempts, consider moving on to the next one.
+   keyword matching (BM25-ranked -- graded by relevance, not just presence), good for \
+   a name/number/exact phrase; boolean_search is also literal keyword matching but with \
+   NO ranking at all, useful when you need strict AND/OR/NOT control rather than a \
+   best-guess match. If a sub-task remains unresolved after 3 attempts, consider moving \
+   on to the next one.
 
 Do not include your uncommon internal knowledge in this analysis, as it may be \
 inaccurate -- only reason about the evidence log below.
@@ -165,11 +167,17 @@ Available actions (all operate over the same English evidence corpus; only relev
 when taking action 1 above):
 - semantic_search(query): dense embedding retrieval -- good for \
   paraphrased/conceptual matches.
-- exact_search(keywords): sparse exact-keyword retrieval -- good for names, \
-  numbers, and exact phrases that embeddings tend to blur together.
-- weighted_fusion(query, w_semantic, w_exact): blend dense and sparse \
-  scoring for one query when neither alone is enough (weights need not sum \
-  to 1).
+- exact_search(keywords): sparse retrieval, BM25-ranked -- good for names, \
+  numbers, and exact phrases that embeddings tend to blur together, while \
+  still graded by relevance (a chunk covering more of your keywords, \
+  proportionally to its length, ranks higher).
+- boolean_search(and_terms, or_terms, not_terms): exact set-based retrieval \
+  with NO ranking -- every match is equally valid. Use when you need strict \
+  logical control ("must mention X and Y, but never Z") rather than a \
+  best-guess ranking; returns nothing if you give it only not_terms (too \
+  unconstrained to be useful).
+- weighted_fusion(query, w_semantic, w_exact): blend dense and BM25 scoring \
+  for one query when neither alone is enough (weights need not sum to 1).
 - entity_match(entity): retrieve chunks that literally mention a specific \
   named entity -- use when you need everything about "that person/place/org."
 - graph_search(entity, hops): traverse a pre-built entity relationship graph \
@@ -190,14 +198,24 @@ When writing the actual query/keywords/entity argument, respect what each \
 action is good at -- do not just restate the Reasoner's full analysis \
 verbatim:
 - semantic_search(query): a short, single-concept natural-language phrase \
-  (roughly 5-15 words). Never concatenate multiple unrelated constraints \
-  (dates, alumni types, distances, etc.) into one query -- that dilutes the \
-  embedding and returns vaguely-related noise instead of a precise match.
+  (roughly 5-15 words), written the way you'd ask a person or type into a \
+  search box. NEVER a structured/SQL-like expression -- bad: "institution \
+  WHERE founded_year BETWEEN 1949 AND 1959 AND alumni_type = minister"; \
+  good: "college founded in the 1950s whose alumni became government \
+  ministers". Never concatenate multiple unrelated constraints (dates, \
+  alumni types, distances, etc.) into one query either, structured or not \
+  -- that dilutes the embedding and returns vaguely-related noise instead \
+  of a precise match.
 - exact_search(keywords) / entity_match(entity): a short exact phrase, \
   proper noun, number, or date you expect to appear verbatim in the corpus. \
   Avoid long descriptive phrases here -- a common word repeated many times \
   in an unrelated document can outrank a genuinely relevant chunk that only \
   mentions it once.
+- boolean_search(and_terms, or_terms, not_terms): each entry should be one \
+  word or short phrase, not a sentence -- e.g. and_terms=["bank", "ceo"], \
+  not_terms=["dictionary"]. Only use this when the Reasoner's analysis (or \
+  the question itself) genuinely calls for strict inclusion/exclusion logic \
+  rather than "find the best match."
 - weighted_fusion(query, w_semantic, w_exact): use for ONE reasonably \
   specific query when you want to hedge between its literal and conceptual \
   interpretation -- not as a way to combine several different facts into a \
@@ -214,7 +232,22 @@ INTERACT_TOOLS = [
         "type": "function",
         "function": {
             "name": "semantic_search",
-            "description": "Dense embedding retrieval over the evidence corpus -- good for conceptual/paraphrased matches.",
+            "description": (
+                "Dense embedding retrieval: ranks chunks by conceptual similarity to a "
+                "natural-language query. `query` must be plain prose, written the way "
+                "a person would ask it or type it into a search box -- NEVER a "
+                "structured/SQL-like expression. Bad: \"institution WHERE "
+                "founded_year BETWEEN 1949 AND 1959 AND alumni_type = minister\". "
+                "Good: \"college founded in the 1950s whose alumni became government "
+                "ministers\". Best for a single, self-contained factual question or a "
+                "paraphrase-tolerant lookup. Weak on complex multi-hop questions that "
+                "chain several linked facts in one query -- it embeds the whole query "
+                "into one vector, so packing multiple sub-facts together (structured "
+                "or not) dilutes rather than resolves them; resolve one hop per call "
+                "instead. Also weak at pinpointing exact names/numbers, which it can "
+                "conflate with semantically similar but distinct ones -- use "
+                "exact_search for those."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -228,7 +261,16 @@ INTERACT_TOOLS = [
         "type": "function",
         "function": {
             "name": "exact_search",
-            "description": "Sparse exact-keyword retrieval -- good for names, numbers, and exact phrases.",
+            "description": (
+                "Sparse BM25 retrieval: ranks chunks by how well they cover specific "
+                "keywords/names/numbers/phrases, weighted by term rarity and chunk "
+                "length. Best for anchoring on a term you expect to appear verbatim -- a "
+                "name, date, title, or number embeddings tend to blur together with "
+                "similar ones. Weak on paraphrases or synonyms (a chunk describing the "
+                "same fact in different words won't match), and -- like semantic_search "
+                "-- only resolves one hop per call; it can't itself bridge 'A relates to "
+                "B, and B relates to C.'"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -241,8 +283,39 @@ INTERACT_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "boolean_search",
+            "description": (
+                "Exact AND/OR/NOT set retrieval over keywords, with NO relevance "
+                "ranking -- every match is equally valid, there's no 'close enough.' "
+                "Best for precisely narrowing an already-identified small set of "
+                "candidates (must mention X and Y, must not mention Z) once you know "
+                "the exact terms that separate them. Weak as a first/exploratory "
+                "search since it can't rank or suggest anything close to a term you "
+                "didn't specify, and returns nothing if you give only not_terms."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "and_terms": {"type": "array", "items": {"type": "string"}, "description": "Chunk must contain ALL of these terms."},
+                    "or_terms": {"type": "array", "items": {"type": "string"}, "description": "Chunk must contain AT LEAST ONE of these terms."},
+                    "not_terms": {"type": "array", "items": {"type": "string"}, "description": "Chunk must contain NONE of these terms."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "weighted_fusion",
-            "description": "Blend dense and sparse retrieval for one query using the given weights.",
+            "description": (
+                "Blends dense (semantic) and BM25 (exact) scoring for one query. Best "
+                "when you're unsure whether the answer surfaces via conceptual "
+                "similarity or a literal keyword match, and want to hedge rather than "
+                "commit to one. Inherits both underlying limits: still a single query "
+                "per call (no multi-hop), and a vague/generic query with high w_semantic "
+                "can wash out what would otherwise be a strong exact-keyword signal."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -258,7 +331,15 @@ INTERACT_TOOLS = [
         "type": "function",
         "function": {
             "name": "entity_match",
-            "description": "Retrieve chunks that literally mention a specific named entity (person, place, organization, etc.).",
+            "description": (
+                "Retrieves chunks that literally mention a specific named entity, "
+                "ranked by mention frequency. Best for hopping onto a *second* fact "
+                "once an entity is already known from an earlier result (e.g. found "
+                "'Lala Shri Ram' as a founder -- now pull everything mentioning him to "
+                "find his birthplace). Not useful as a first search before any entity "
+                "is identified, and matching is literal -- a typo, alias, or "
+                "translated form of the name won't match."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -272,7 +353,15 @@ INTERACT_TOOLS = [
         "type": "function",
         "function": {
             "name": "graph_search",
-            "description": "Traverse a pre-built entity relationship graph outward from a named entity, returning nearby entities and how they're connected. Returns nothing if the graph hasn't been built for this corpus.",
+            "description": (
+                "Traverses a pre-built entity relationship graph outward from a named "
+                "entity, 1-3 hops. Unlike every other search action here, this CAN "
+                "resolve a multi-hop chain (entity -> relation -> entity -> relation -> "
+                "entity) in a single call, when the graph has been built for this "
+                "corpus -- it returns nothing if not, so fall back to entity_match or "
+                "exact_search then. The graph is LLM-extracted and may be incomplete, "
+                "so an empty result doesn't prove a relationship doesn't exist."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -287,7 +376,12 @@ INTERACT_TOOLS = [
         "type": "function",
         "function": {
             "name": "include_docs",
-            "description": "Pin specific document IDs so they are guaranteed to appear in subsequent retrievals.",
+            "description": (
+                "Pins specific document IDs so they're guaranteed to appear in later "
+                "retrievals. Use to lock in a document you've already confirmed is "
+                "relevant, so scale limits or reranking in later calls can't drop it. "
+                "Not a search action itself -- it only shapes what later searches surface."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -301,7 +395,12 @@ INTERACT_TOOLS = [
         "type": "function",
         "function": {
             "name": "exclude_docs",
-            "description": "Filter out specific document IDs from subsequent retrievals.",
+            "description": (
+                "Filters specific document IDs out of later retrievals. Use to "
+                "permanently remove a document you've confirmed is irrelevant or "
+                "noisy, so it stops resurfacing across subsequent calls. Not a search "
+                "action itself -- it only shapes what later searches surface."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -315,7 +414,12 @@ INTERACT_TOOLS = [
         "type": "function",
         "function": {
             "name": "adjust_scale",
-            "description": "Change how many chunks are returned per subsequent retrieval.",
+            "description": (
+                "Changes how many chunks come back per later retrieval. Increase "
+                "while still exploring broadly; decrease once you've narrowed in, to "
+                "cut noise. Not a search action itself -- it only shapes result size "
+                "for later calls."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -329,7 +433,9 @@ INTERACT_TOOLS = [
 
 # Actions that retrieve evidence (tracked in retrieved_docids); the rest
 # (include_docs/exclude_docs/adjust_scale) only mutate interaction state.
-RETRIEVAL_ACTIONS = {"semantic_search", "exact_search", "weighted_fusion", "entity_match", "graph_search"}
+RETRIEVAL_ACTIONS = {
+    "semantic_search", "exact_search", "boolean_search", "weighted_fusion", "entity_match", "graph_search",
+}
 
 
 def _dispatch(engine: CorpusInteractionEngine, name: str, args: dict) -> tuple[str, list[str]]:
@@ -338,6 +444,12 @@ def _dispatch(engine: CorpusInteractionEngine, name: str, args: dict) -> tuple[s
         hits = engine.semantic_search(args.get("query", ""))
     elif name == "exact_search":
         hits = engine.exact_search(args.get("keywords", ""))
+    elif name == "boolean_search":
+        hits = engine.boolean_search(
+            and_terms=args.get("and_terms") or [],
+            or_terms=args.get("or_terms") or [],
+            not_terms=args.get("not_terms") or [],
+        )
     elif name == "weighted_fusion":
         hits = engine.weighted_fusion(
             args.get("query", ""),
@@ -365,14 +477,42 @@ def _dispatch(engine: CorpusInteractionEngine, name: str, args: dict) -> tuple[s
     return json.dumps(payload, ensure_ascii=False), docids
 
 
-def _format_evidence(evidence_log: list[dict]) -> str:
+def _format_evidence(evidence_log: list[dict], char_budget: int = None) -> str:
+    """Renders evidence_log within a hard character budget, newest-first
+    priority. Without a cap, restating the *entire* history every turn grows
+    unbounded with turn count and can overflow the model's context window on
+    a long-running query -- or even from one oversized `adjust_scale` call
+    (up to 50 chunks x ~400-word snippets is ~26k tokens by itself). Older
+    rounds are dropped first; a single round that alone exceeds the budget
+    is hard-truncated rather than dropped, so the Reasoner always sees at
+    least the most recent result. `evidence_log` itself is untouched --
+    callers that need the full history (the run's own trace) are unaffected.
+    """
     if not evidence_log:
         return "(no evidence gathered yet)"
-    lines = []
-    for entry in evidence_log:
-        lines.append(f"[Turn {entry['turn']}] {entry['action']}({entry['args']}):")
-        lines.append(entry["output"])
-    return "\n".join(lines)
+    if char_budget is None:
+        char_budget = config.evidence_char_budget
+
+    kept_blocks = []
+    total_chars = 0
+    dropped = 0
+    for entry in reversed(evidence_log):
+        block = f"[Turn {entry['turn']}] {entry['action']}({entry['args']}):\n{entry['output']}"
+        if len(block) > char_budget:
+            block = block[:char_budget] + "\n...[truncated -- this single result exceeded the evidence budget]"
+        if kept_blocks and total_chars + len(block) > char_budget:
+            dropped += 1
+            continue
+        kept_blocks.append(block)
+        total_chars += len(block)
+
+    kept_blocks.reverse()
+    header = (
+        f"[{dropped} earlier search round(s) omitted to stay within context -- "
+        "rely on the Global-Planner's plan for what they covered]\n\n"
+        if dropped else ""
+    )
+    return header + "\n".join(kept_blocks)
 
 
 _DEFAULT_DECISION = {
@@ -465,6 +605,12 @@ class InteractAgent:
             f"Global-Planner's plan:\n{plan}\n\n"
             f"Evidence gathered so far:\n{_format_evidence(evidence_log)}\n"
         )
+        if not self.engine.entity_graph.is_built:
+            user_content += (
+                "\n(No entity relationship graph is available for this corpus -- "
+                "do not propose graph_search; use entity_match or exact_search "
+                "for entity-relationship questions instead.)\n"
+            )
         if force_answer:
             user_content += (
                 "\nThis is the final allowed turn -- you MUST choose path B) Conclude "
@@ -487,6 +633,19 @@ class InteractAgent:
         })
         return decision
 
+    def _available_tools(self) -> list[dict]:
+        """INTERACT_TOOLS, minus graph_search when no graph has been built
+        for this corpus. Documenting "returns nothing if not built" in the
+        tool description isn't enough -- a model can still reach for it
+        preferentially (it's the one action described as handling multi-hop
+        in a single call) and waste a turn on a call that's guaranteed
+        empty. Making it physically uncallable removes that failure mode
+        instead of relying on the model to notice and self-correct.
+        """
+        if self.engine.entity_graph.is_built:
+            return INTERACT_TOOLS
+        return [t for t in INTERACT_TOOLS if t["function"]["name"] != "graph_search"]
+
     def _run_executor(
         self, question: str, analysis: str, force_answer: bool, turn: int, transcript: list[dict],
     ) -> dict:
@@ -501,6 +660,11 @@ class InteractAgent:
             f"Original question (in the source language): {question}\n\n"
             f"Adaptive-Reasoner's analysis of prior search results:\n{analysis}"
         )
+        if not self.engine.entity_graph.is_built:
+            user_content += (
+                "\n\n(No entity relationship graph is available for this corpus -- "
+                "graph_search is not offered as an option this run.)"
+            )
         if force_answer:
             user_content += (
                 "\n\nThis is the final allowed turn -- you cannot search anymore. "
@@ -513,7 +677,7 @@ class InteractAgent:
         response = self.client.chat.completions.create(
             model=config.executor_model,
             messages=messages,
-            tools=INTERACT_TOOLS,
+            tools=self._available_tools(),
             tool_choice="none" if force_answer else "auto",
             temperature=config.temperature,
         )

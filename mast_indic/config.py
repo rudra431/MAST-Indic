@@ -96,6 +96,13 @@ class Config:
     max_turns: int = field(default_factory=lambda: _int("MAST_MAX_TURNS", 8))
     top_k: int = field(default_factory=lambda: _int("MAST_TOP_K", 5))
     snippet_max_tokens: int = field(default_factory=lambda: _int("MAST_SNIPPET_MAX_TOKENS", 512))
+    # Hard cap (characters) on how much accumulated evidence
+    # mast_indic/interact_agent.py restates to the Adaptive-Reasoner each
+    # turn. Without this, a long-running query (many turns) or even one
+    # oversized adjust_scale call can grow the prompt past the model's
+    # context window -- older evidence rounds are dropped first once this
+    # is exceeded; the full evidence is still kept in the run's own trace.
+    evidence_char_budget: int = field(default_factory=lambda: _int("MAST_EVIDENCE_CHAR_BUDGET", 60000))
 
     # Output
     runs_dir: str = field(default_factory=lambda: os.environ.get("MAST_RUNS_DIR", "runs"))

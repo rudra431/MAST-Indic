@@ -4,8 +4,9 @@ Inspired by Interact-RAG (arXiv:2510.27566), which reframes retrieval from a
 single black-box "search" call into an explicit action space an LLM agent
 can compose turn by turn:
 
-- Multi-faceted retrieval: dense `semantic_search`, sparse `exact_search`,
-  and `weighted_fusion` of the two.
+- Multi-faceted retrieval: dense `semantic_search`, BM25-ranked sparse
+  `exact_search`, exact `boolean_search` (AND/OR/NOT over terms, unranked),
+  and `weighted_fusion` blending dense with BM25.
 - Anchored matching: `entity_match` (literal mentions in chunk text) and
   `graph_search` (multi-hop traversal of a pre-built entity relationship
   graph -- see `graph_builder.py`/`entity_graph.py`).
@@ -19,15 +20,20 @@ training pipeline (synthetic trajectory generation, SFT, GRPO). See
 `mast_indic/interact_agent.py` for the zero-shot, prompted agent that drives
 these actions instead of a fine-tuned policy.
 
-`exact_search` is a simple case-insensitive keyword-count scorer, not real
-BM25 -- consistent with this project's existing "flat matrix, brute-force
-scan" scale (see `index.py`); swap in `rank_bm25` or an inverted index if
-you outgrow it.
+`exact_search`/`boolean_search` are backed by a real in-memory inverted
+index (`_build_inverted_index`), built once per `CorpusInteractionEngine`
+instance rather than per call -- consistent with this project's existing
+"flat matrix, brute-force scan" scale (see `index.py`), but a real
+improvement over a linear per-query scan: after the one-time build, both
+become O(query terms) lookups instead of O(corpus size). Swap in a
+persisted index (Lucene/Elasticsearch/`rank_bm25` with disk caching) if you
+outgrow rebuilding it every process start.
 """
 from __future__ import annotations
 
+import math
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Iterable
 
@@ -35,6 +41,10 @@ import numpy as np
 
 from .entity_graph import EntityGraph
 from .index import SearchHit, SearchIndex, _normalize, embed_texts
+
+# Standard Okapi BM25 parameters (Robertson & Zaragoza, 2009 defaults).
+BM25_K1 = 1.5
+BM25_B = 0.75
 
 
 @dataclass
@@ -67,9 +77,33 @@ class CorpusInteractionEngine:
         # Lazily loads index_store/relations.jsonl if present; graph_search
         # simply returns nothing if graph_builder.py hasn't been run yet.
         self.entity_graph = entity_graph if entity_graph is not None else EntityGraph()
+        self._build_inverted_index()
 
     def reset(self) -> None:
         self.state = InteractionState()
+
+    # -- inverted index (built once, shared by exact_search/boolean_search) --
+
+    def _build_inverted_index(self) -> None:
+        """Tokenize every chunk once and build term -> {chunk_idx: term_freq}
+        postings plus per-term document frequency. This is the one-time
+        O(corpus size) cost that turns exact_search/boolean_search into
+        O(query terms) lookups afterward, instead of a fresh linear scan
+        over every chunk on every call.
+        """
+        self._postings: dict[str, dict[int, int]] = defaultdict(dict)
+        self._doc_freq: dict[str, int] = defaultdict(int)
+        num_docs = len(self.index.meta)
+        doc_lens = np.zeros(num_docs, dtype=np.float64)
+        for i, m in enumerate(self.index.meta):
+            tokens = _tokenize(m["text"])
+            doc_lens[i] = len(tokens)
+            for term, tf in Counter(tokens).items():
+                self._postings[term][i] = tf
+                self._doc_freq[term] += 1
+        self._doc_lens = doc_lens
+        self._num_docs = num_docs
+        self._avg_doc_len = float(doc_lens.mean()) if num_docs else 0.0
 
     # -- scoring ---------------------------------------------------------
 
@@ -77,33 +111,42 @@ class CorpusInteractionEngine:
         qvec = _normalize(embed_texts([query]))[0]
         return self.index.matrix @ qvec  # cosine sim, both sides normalized
 
-    def _sparse_scores(self, keywords: str) -> np.ndarray:
-        """Rank by number of *distinct* query terms matched, not raw frequency.
-
-        A plain sum of substring counts lets one repeated common word win
-        outright -- e.g. a dictionary page listing dozens of "bank ___"
-        compound words would outscore a chunk that actually mentions
-        "bank", "CEO", "minister", and "civil servant" once each. Distinct
-        coverage dominates the score here; total occurrence count only
-        breaks ties among chunks that cover the same number of terms.
+    def _bm25_raw(self, keywords: str, k1: float = BM25_K1, b: float = BM25_B) -> np.ndarray:
+        """Okapi BM25 over the inverted index: term-frequency saturation (a
+        term repeated many times in one chunk stops adding score linearly)
+        and length normalization (a long chunk needs proportionally more
+        hits than a short one to score as well), on top of inverse document
+        frequency. This is what actually fixes the earlier ad-hoc scorer's
+        failure mode (a long dictionary-style chunk repeating one common
+        term beating a chunk that genuinely covers several distinguishing
+        terms): BM25 caps how much repetition alone can contribute and
+        penalizes it for chunk length, rather than just counting distinct
+        terms matched.
         """
-        unique_terms = set(_tokenize(keywords))
-        scores = np.zeros(len(self.index.meta), dtype=np.float32)
-        if not unique_terms:
+        terms = set(_tokenize(keywords))
+        scores = np.zeros(self._num_docs, dtype=np.float64)
+        if not terms or not self._num_docs:
             return scores
-        for i, m in enumerate(self.index.meta):
-            text_lower = m["text"].lower()
-            matched_terms = 0
-            total_count = 0
-            for t in unique_terms:
-                c = text_lower.count(t)
-                if c:
-                    matched_terms += 1
-                    total_count += c
-            if matched_terms:
-                scores[i] = matched_terms + min(total_count, 20) / 1000.0
-        peak = scores.max()
-        return scores / peak if peak > 0 else scores  # rescale to ~[0, 1] alongside cosine sim
+        for term in terms:
+            postings = self._postings.get(term)
+            if not postings:
+                continue
+            df = self._doc_freq[term]
+            idf = math.log(1.0 + (self._num_docs - df + 0.5) / (df + 0.5))
+            if idf <= 0:
+                continue
+            for doc_idx, tf in postings.items():
+                norm_len = (self._doc_lens[doc_idx] / self._avg_doc_len) if self._avg_doc_len else 0.0
+                denom = tf + k1 * (1 - b + b * norm_len)
+                scores[doc_idx] += idf * (tf * (k1 + 1)) / denom
+        return scores
+
+    def _sparse_scores(self, keywords: str) -> np.ndarray:
+        """BM25 ranking, rescaled to ~[0, 1] alongside cosine similarity so
+        weighted_fusion's linear blend with dense scores stays meaningful."""
+        raw = self._bm25_raw(keywords)
+        peak = raw.max()
+        return raw / peak if peak > 0 else raw
 
     # -- ranking / context shaping ----------------------------------------
 
@@ -142,6 +185,30 @@ class CorpusInteractionEngine:
             hits.append(SearchHit(docid=docid, url=m["url"], score=score, snippet=" ".join(words[:400])))
         return hits
 
+    def _rank_exact(self, matched: set[int]) -> list[SearchHit]:
+        """Like `_rank`, but for boolean/exact matches: returns *only* the
+        chunks in `matched` (deduped per document, capped at `adjust_scale`)
+        -- never padded with non-matching filler the way `_rank`'s
+        score-everything-then-take-top-K does, since "no match" has to mean
+        zero results here, not the corpus's least-bad guess. Pinned docs
+        from `include_docs` are intentionally NOT force-included -- forcing
+        in a document that doesn't actually satisfy the boolean expression
+        would contradict what this action is for.
+        """
+        best_per_doc: dict[str, int] = {}
+        for idx in sorted(matched):
+            docid = self.index.meta[idx]["docid"]
+            if docid in self.state.excluded_docids or docid in best_per_doc:
+                continue
+            best_per_doc[docid] = idx
+
+        hits = []
+        for docid, idx in list(best_per_doc.items())[: self.state.scale]:
+            m = self.index.meta[idx]
+            words = m["text"].split()
+            hits.append(SearchHit(docid=docid, url=m["url"], score=1.0, snippet=" ".join(words[:400])))
+        return hits
+
     # -- action primitives -------------------------------------------------
 
     def semantic_search(self, query: str) -> list[SearchHit]:
@@ -149,8 +216,51 @@ class CorpusInteractionEngine:
         return self._rank(self._dense_scores(query))
 
     def exact_search(self, keywords: str) -> list[SearchHit]:
-        """Sparse retrieval: exact keyword occurrence ranking."""
+        """Sparse retrieval: BM25 ranking over the inverted index."""
         return self._rank(self._sparse_scores(keywords))
+
+    def boolean_search(
+        self,
+        and_terms: Iterable[str] | None = None,
+        or_terms: Iterable[str] | None = None,
+        not_terms: Iterable[str] | None = None,
+    ) -> list[SearchHit]:
+        """Exact boolean retrieval: set operations over the inverted index's
+        postings lists, with no ranking at all -- every match is treated as
+        equally valid (score 1.0), unlike BM25's graded relevance. AND
+        requires every one of `and_terms` present; OR requires at least one
+        of `or_terms`; if both are given, both constraints must hold
+        (AND-of-ANDs-and-the-OR-group); NOT excludes any chunk containing a
+        term in `not_terms`, applied last. Returns nothing if neither
+        `and_terms` nor `or_terms` is given, since that would otherwise
+        match (most of) the corpus.
+        """
+        and_terms = [t.lower().strip() for t in (and_terms or []) if t and t.strip()]
+        or_terms = [t.lower().strip() for t in (or_terms or []) if t and t.strip()]
+        not_terms = [t.lower().strip() for t in (not_terms or []) if t and t.strip()]
+
+        if not and_terms and not or_terms:
+            return []
+
+        matched: set[int] | None = None
+        for term in and_terms:
+            term_docs = set(self._postings.get(term, {}).keys())
+            matched = term_docs if matched is None else (matched & term_docs)
+            if not matched:
+                matched = set()
+                break
+
+        if or_terms:
+            or_union: set[int] = set()
+            for term in or_terms:
+                or_union |= set(self._postings.get(term, {}).keys())
+            matched = or_union if matched is None else (matched & or_union)
+
+        matched = matched or set()
+        for term in not_terms:
+            matched -= set(self._postings.get(term, {}).keys())
+
+        return self._rank_exact(matched)
 
     def weighted_fusion(self, query: str, w_semantic: float, w_exact: float) -> list[SearchHit]:
         """Blend dense and sparse scores for `query` with the given weights."""
