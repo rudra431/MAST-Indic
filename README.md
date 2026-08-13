@@ -138,6 +138,16 @@ reasoning, search queries, hit counts/docids, and final answer to stderr as
 they happen -- useful for seeing where a run stalls or loops without waiting
 for the whole JSONL file.
 
+**Partial results survive a mid-run failure.** If a query hits a timeout,
+connection drop, or 5xx partway through (say, on turn 8 of a long-running
+one), the turns already completed aren't discarded -- `result` still
+contains everything gathered before the failure, with a trailing
+`{"type": "error", "output": "Agent failed mid-run: ..."}` entry and a
+top-level `"error"` field on the record (also picked up by `eval.py` and
+`tools/trace_viewer.html` the same way an incomplete run already is). Only
+a crash *before* the first LLM call (e.g. a bug outside the agent loop
+itself) falls back to the old all-or-nothing `"result": []` shape.
+
 **Before submitting:** double-check this record shape against the live
 example runs / evaluation code in the BrowseComp-Plus repo
 (`search_agent/`, `scripts_evaluation/evaluate_run.py`) — this skeleton

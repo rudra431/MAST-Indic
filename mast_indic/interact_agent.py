@@ -709,100 +709,118 @@ class InteractAgent:
         evidence_log: list[dict] = []
         transcript: list[dict] = []
         final_answer = ""
+        error: str | None = None
 
         _debug(f"=== query {query_id} [{language}]: {query_text!r}")
 
-        plan = self._run_planner(query_text, transcript)
-        _debug(f"planner plan: {plan[:500]}{'...' if len(plan) > 500 else ''}")
-        result.append({
-            "type": "reasoning", "tool_name": None, "arguments": None,
-            "output": plan, "role": "planner", "model": config.planner_model,
-        })
-
-        for turn in range(config.max_turns):
-            last_turn = turn == config.max_turns - 1
-            _debug(f"--- turn {turn + 1}/{config.max_turns}{' (final, must answer)' if last_turn else ''}")
-
-            # Advisory only -- the Reasoner never ends the episode itself
-            # (matching the paper); the Executor below decides that every
-            # turn, regardless of which path the Reasoner narrated here.
-            decision = self._run_reasoner(
-                query_text, plan, evidence_log, force_answer=last_turn,
-                turn=turn + 1, transcript=transcript,
-            )
-            _debug(f"reasoner decision: {decision['decision']} - {decision['analysis'][:300]}")
+        # Everything below can raise (timeout, connection drop, 5xx, ...) on
+        # any of the three roles' calls, on any turn. Catching here rather
+        # than letting it propagate means a failure on turn 15 doesn't
+        # discard the 14 turns of plan/analysis/search results already
+        # gathered -- whatever's in `result`/`transcript` so far is still
+        # returned, just tagged with `error` instead of ending in a final
+        # answer.
+        try:
+            plan = self._run_planner(query_text, transcript)
+            _debug(f"planner plan: {plan[:500]}{'...' if len(plan) > 500 else ''}")
             result.append({
-                "type": "reasoning",
-                "tool_name": None,
-                "arguments": None,
-                "output": decision["analysis"],
-                "role": "reasoner",
-                "model": config.reasoner_model,
-                "decision": decision,
+                "type": "reasoning", "tool_name": None, "arguments": None,
+                "output": plan, "role": "planner", "model": config.planner_model,
             })
 
-            exec_result = self._run_executor(
-                query_text, decision["analysis"], force_answer=last_turn,
-                turn=turn + 1, transcript=transcript,
-            )
+            for turn in range(config.max_turns):
+                last_turn = turn == config.max_turns - 1
+                _debug(f"--- turn {turn + 1}/{config.max_turns}{' (final, must answer)' if last_turn else ''}")
 
-            if exec_result["final_text"] is not None:
-                final_answer = _ensure_final_answer_format(exec_result["final_text"])
-                _debug(f"final answer: {final_answer!r}")
-                result.append({
-                    "type": "output_text",
-                    "tool_name": None,
-                    "arguments": None,
-                    "output": final_answer,
-                    "role": "executor",
-                    "model": config.executor_model,
-                })
-                break
-
-            tool_calls = exec_result["tool_calls"]
-            if not tool_calls:
-                _debug("executor returned no tool calls and no final answer")
+                # Advisory only -- the Reasoner never ends the episode itself
+                # (matching the paper); the Executor below decides that every
+                # turn, regardless of which path the Reasoner narrated here.
+                decision = self._run_reasoner(
+                    query_text, plan, evidence_log, force_answer=last_turn,
+                    turn=turn + 1, transcript=transcript,
+                )
+                _debug(f"reasoner decision: {decision['decision']} - {decision['analysis'][:300]}")
                 result.append({
                     "type": "reasoning",
                     "tool_name": None,
                     "arguments": None,
-                    "output": "(Executor neither searched nor answered this turn)",
-                    "role": "executor",
-                    "model": config.executor_model,
-                })
-                continue
-
-            for name, args in tool_calls:
-                tool_call_counts[name] = tool_call_counts.get(name, 0) + 1
-                tool_output, docids = _dispatch(self.engine, name, args)
-                if name in RETRIEVAL_ACTIONS:
-                    retrieved_docids.append(docids)
-                evidence_log.append({"turn": turn + 1, "action": name, "args": args, "output": tool_output})
-                _debug(f"executor {name}({args}) -> {tool_output[:300]}{'...' if len(tool_output) > 300 else ''}")
-                result.append({
-                    "type": "tool_call",
-                    "tool_name": name,
-                    "arguments": json.dumps(args, ensure_ascii=False),
-                    "output": tool_output,
-                    "role": "executor",
-                    "model": config.executor_model,
+                    "output": decision["analysis"],
+                    "role": "reasoner",
+                    "model": config.reasoner_model,
+                    "decision": decision,
                 })
 
-            if last_turn:
-                # tool_choice="none" *should* have made this impossible, but
-                # don't trust every OpenAI-compatible server to honor it --
-                # there's no next turn to get a real answer on, so fall back
-                # rather than end with no output_text at all.
-                _debug("executor searched anyway on the forced final turn -- falling back")
-                final_answer = _ensure_final_answer_format("")
-                result.append({
-                    "type": "output_text",
-                    "tool_name": None,
-                    "arguments": None,
-                    "output": final_answer,
-                    "role": "executor",
-                    "model": config.executor_model,
-                })
+                exec_result = self._run_executor(
+                    query_text, decision["analysis"], force_answer=last_turn,
+                    turn=turn + 1, transcript=transcript,
+                )
+
+                if exec_result["final_text"] is not None:
+                    final_answer = _ensure_final_answer_format(exec_result["final_text"])
+                    _debug(f"final answer: {final_answer!r}")
+                    result.append({
+                        "type": "output_text",
+                        "tool_name": None,
+                        "arguments": None,
+                        "output": final_answer,
+                        "role": "executor",
+                        "model": config.executor_model,
+                    })
+                    break
+
+                tool_calls = exec_result["tool_calls"]
+                if not tool_calls:
+                    _debug("executor returned no tool calls and no final answer")
+                    result.append({
+                        "type": "reasoning",
+                        "tool_name": None,
+                        "arguments": None,
+                        "output": "(Executor neither searched nor answered this turn)",
+                        "role": "executor",
+                        "model": config.executor_model,
+                    })
+                    continue
+
+                for name, args in tool_calls:
+                    tool_call_counts[name] = tool_call_counts.get(name, 0) + 1
+                    tool_output, docids = _dispatch(self.engine, name, args)
+                    if name in RETRIEVAL_ACTIONS:
+                        retrieved_docids.append(docids)
+                    evidence_log.append({"turn": turn + 1, "action": name, "args": args, "output": tool_output})
+                    _debug(f"executor {name}({args}) -> {tool_output[:300]}{'...' if len(tool_output) > 300 else ''}")
+                    result.append({
+                        "type": "tool_call",
+                        "tool_name": name,
+                        "arguments": json.dumps(args, ensure_ascii=False),
+                        "output": tool_output,
+                        "role": "executor",
+                        "model": config.executor_model,
+                    })
+
+                if last_turn:
+                    # tool_choice="none" *should* have made this impossible, but
+                    # don't trust every OpenAI-compatible server to honor it --
+                    # there's no next turn to get a real answer on, so fall back
+                    # rather than end with no output_text at all.
+                    _debug("executor searched anyway on the forced final turn -- falling back")
+                    final_answer = _ensure_final_answer_format("")
+                    result.append({
+                        "type": "output_text",
+                        "tool_name": None,
+                        "arguments": None,
+                        "output": final_answer,
+                        "role": "executor",
+                        "model": config.executor_model,
+                    })
+        except Exception as exc:  # noqa: BLE001 -- save the partial trace rather than losing it
+            error = repr(exc)
+            _debug(f"answer() failed mid-run: {error}")
+            result.append({
+                "type": "error",
+                "tool_name": None,
+                "arguments": None,
+                "output": f"Agent failed mid-run: {error}",
+            })
 
         return AgentResult(
             query_id=query_id,
@@ -811,4 +829,5 @@ class InteractAgent:
             tool_call_counts=tool_call_counts,
             result=result,
             transcript=transcript,
+            error=error,
         )

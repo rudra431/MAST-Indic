@@ -154,6 +154,7 @@ class AgentResult:
     tool_call_counts: dict[str, int]
     result: list[dict]
     transcript: list[dict] = field(default_factory=list)
+    error: str | None = None
 
 
 class ExactSearchAgent:
@@ -209,94 +210,111 @@ class ExactSearchAgent:
         tool_call_counts: dict[str, int] = {"search": 0}
         result: list[dict] = []
         final_answer = ""
+        error: str | None = None
 
         _debug(f"=== query {query_id} [{language}]: {query_text!r}")
 
-        subqueries = self._run_planner(query_text)
-        _debug(f"planner subqueries: {subqueries}")
-        if subqueries:
-            plan_text = "\n".join(f"{i + 1}. {q}" for i, q in enumerate(subqueries))
-            result.append({
-                "type": "reasoning",
-                "tool_name": None,
-                "arguments": None,
-                "output": plan_text,
-                "role": "planner",
-                "model": config.planner_model,
-            })
-            messages.append({
-                "role": "user",
-                "content": (
-                    "A planning step decomposed this question into the following atomic "
-                    "sub-queries. Use them as your starting `search` calls, one atomic fact "
-                    "per call -- you aren't required to follow this exact order, and can skip "
-                    "one you resolve incidentally along the way:\n" + plan_text
-                ),
-            })
-
-        for turn in range(config.max_turns):
-            last_turn = turn == config.max_turns - 1
-            _debug(f"--- turn {turn + 1}/{config.max_turns}{' (final, tools disabled)' if last_turn else ''}")
-            if last_turn:
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        "You have used all available search turns and cannot call "
-                        "any more tools. Based only on the evidence already "
-                        "gathered, respond now in exactly this format:\n"
-                        "Explanation: <one or two sentences citing what you found>\n"
-                        "Exact Answer: <the short factual answer alone>"
-                    ),
-                })
-            response = self.client.chat.completions.create(
-                model=config.chat_model,
-                messages=messages,
-                tools=[SEARCH_TOOL],
-                tool_choice="none" if last_turn else "auto",
-                temperature=config.temperature,
-            )
-            message = response.choices[0].message
-            messages.append(message.model_dump(exclude_none=True))
-
-            reasoning = getattr(message, "reasoning", None) or getattr(message, "reasoning_content", None)
-            if reasoning:
-                _debug(f"reasoning: {reasoning[:500]}{'...' if len(reasoning) > 500 else ''}")
+        # Everything below can raise (timeout, connection drop, 5xx, ...) on
+        # any turn -- including the planner call. Catching here rather than
+        # letting it propagate means a failure mid-run doesn't discard the
+        # turns of search results already gathered; whatever's in
+        # `result`/`messages` so far is still returned, just tagged with
+        # `error` instead of ending in a final answer.
+        try:
+            subqueries = self._run_planner(query_text)
+            _debug(f"planner subqueries: {subqueries}")
+            if subqueries:
+                plan_text = "\n".join(f"{i + 1}. {q}" for i, q in enumerate(subqueries))
                 result.append({
                     "type": "reasoning",
                     "tool_name": None,
                     "arguments": None,
-                    "output": reasoning,
-                })
-
-            if not message.tool_calls:
-                final_answer = (message.content or "").strip()
-                _debug(f"final answer: {final_answer!r}")
-                result.append({
-                    "type": "output_text",
-                    "tool_name": None,
-                    "arguments": None,
-                    "output": final_answer,
-                })
-                break
-
-            for tool_call in message.tool_calls:
-                args = json.loads(tool_call.function.arguments or "{}")
-                keywords = args.get("keywords", "")
-                tool_call_counts["search"] = tool_call_counts.get("search", 0) + 1
-                tool_output, docids = self._run_search_tool(keywords)
-                retrieved_docids.append(docids)
-                _debug(f"search({keywords!r}) -> {len(docids)} hits: {docids}")
-                result.append({
-                    "type": "tool_call",
-                    "tool_name": "search",
-                    "arguments": f"keywords: {json.dumps(keywords, ensure_ascii=False)}",
-                    "output": tool_output,
+                    "output": plan_text,
+                    "role": "planner",
+                    "model": config.planner_model,
                 })
                 messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": tool_output,
+                    "role": "user",
+                    "content": (
+                        "A planning step decomposed this question into the following atomic "
+                        "sub-queries. Use them as your starting `search` calls, one atomic fact "
+                        "per call -- you aren't required to follow this exact order, and can skip "
+                        "one you resolve incidentally along the way:\n" + plan_text
+                    ),
                 })
+
+            for turn in range(config.max_turns):
+                last_turn = turn == config.max_turns - 1
+                _debug(f"--- turn {turn + 1}/{config.max_turns}{' (final, tools disabled)' if last_turn else ''}")
+                if last_turn:
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "You have used all available search turns and cannot call "
+                            "any more tools. Based only on the evidence already "
+                            "gathered, respond now in exactly this format:\n"
+                            "Explanation: <one or two sentences citing what you found>\n"
+                            "Exact Answer: <the short factual answer alone>"
+                        ),
+                    })
+                response = self.client.chat.completions.create(
+                    model=config.chat_model,
+                    messages=messages,
+                    tools=[SEARCH_TOOL],
+                    tool_choice="none" if last_turn else "auto",
+                    temperature=config.temperature,
+                )
+                message = response.choices[0].message
+                messages.append(message.model_dump(exclude_none=True))
+
+                reasoning = getattr(message, "reasoning", None) or getattr(message, "reasoning_content", None)
+                if reasoning:
+                    _debug(f"reasoning: {reasoning[:500]}{'...' if len(reasoning) > 500 else ''}")
+                    result.append({
+                        "type": "reasoning",
+                        "tool_name": None,
+                        "arguments": None,
+                        "output": reasoning,
+                    })
+
+                if not message.tool_calls:
+                    final_answer = (message.content or "").strip()
+                    _debug(f"final answer: {final_answer!r}")
+                    result.append({
+                        "type": "output_text",
+                        "tool_name": None,
+                        "arguments": None,
+                        "output": final_answer,
+                    })
+                    break
+
+                for tool_call in message.tool_calls:
+                    args = json.loads(tool_call.function.arguments or "{}")
+                    keywords = args.get("keywords", "")
+                    tool_call_counts["search"] = tool_call_counts.get("search", 0) + 1
+                    tool_output, docids = self._run_search_tool(keywords)
+                    retrieved_docids.append(docids)
+                    _debug(f"search({keywords!r}) -> {len(docids)} hits: {docids}")
+                    result.append({
+                        "type": "tool_call",
+                        "tool_name": "search",
+                        "arguments": f"keywords: {json.dumps(keywords, ensure_ascii=False)}",
+                        "output": tool_output,
+                    })
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": tool_output,
+                    })
+        except Exception as exc:  # noqa: BLE001 -- save the partial trace rather than losing it
+            error = repr(exc)
+            _debug(f"answer() failed mid-run: {error}")
+            result.append({
+                "type": "error",
+                "tool_name": None,
+                "arguments": None,
+                "output": f"Agent failed mid-run: {error}",
+            })
 
         return AgentResult(
             query_id=query_id,
@@ -305,4 +323,5 @@ class ExactSearchAgent:
             tool_call_counts=tool_call_counts,
             result=result,
             transcript=messages,
+            error=error,
         )

@@ -36,6 +36,11 @@ def run_language(language: str, limit: int | None = None, save_transcripts: bool
     with open(out_path, "w", encoding="utf-8") as f:
         for q in tqdm(queries, desc=f"answering [exact/{language}]"):
             try:
+                # answer() itself catches mid-run failures (timeouts,
+                # connection drops, 5xx) and returns whatever partial trace
+                # it gathered rather than raising -- this except is now only
+                # a last-resort safety net for something unexpected outside
+                # that (e.g. a bug in our own code before any LLM call).
                 agent_result = agent.answer(q.qid, q.query, language=q.language)
             except Exception as exc:  # noqa: BLE001 -- one bad query must not sink the batch
                 num_failed += 1
@@ -62,6 +67,10 @@ def run_language(language: str, limit: int | None = None, save_transcripts: bool
                 "retrieved_docids": agent_result.retrieved_docids,
                 "result": agent_result.result,
             }
+            if agent_result.error:
+                record["error"] = agent_result.error
+                num_failed += 1
+                tqdm.write(f"[error] {q.qid} failed mid-run (partial trace saved): {agent_result.error}")
             if save_transcripts:
                 record["transcript"] = agent_result.transcript
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
