@@ -39,22 +39,29 @@ def iter_corpus(limit: int | None = None) -> Iterator[dict]:
         yield {"docid": str(row["docid"]), "text": row["text"], "url": row.get("url", "")}
 
 
-MAX_CHUNK_CHARS = 4000  # backstop for whitespace-less runs (URLs, minified code, etc.)
-# that would otherwise blow past the embedding model's token context limit.
+def chunk_text(text: str, chunk_chars: int, overlap_chars: int) -> list[str]:
+    """Split text into overlapping character windows.
 
-
-def chunk_text(text: str, chunk_words: int, overlap_words: int) -> list[str]:
-    words = text.split()
-    if not words:
+    Character-based rather than word-based: sizes chunks directly against
+    the embedding model's context budget via a 1-token-~4-characters
+    approximation, without needing a real tokenizer just to decide chunk
+    boundaries. This also removes the old word-based backstop this project
+    used to need -- slicing raw characters can't produce a pathologically
+    long "word" the way a whitespace split could (a giant URL, minified
+    code with no spaces), so there's no separate overflow case to guard.
+    """
+    if not text:
         return []
-    step = max(chunk_words - overlap_words, 1)
+    if len(text) <= chunk_chars:
+        return [text]
+    stride = max(chunk_chars - overlap_chars, 1)
     chunks = []
-    for start in range(0, len(words), step):
-        chunk = " ".join(words[start:start + chunk_words])[:MAX_CHUNK_CHARS]
-        if chunk:
-            chunks.append(chunk)
-        if start + chunk_words >= len(words):
+    start = 0
+    while start < len(text):
+        chunks.append(text[start:start + chunk_chars])
+        if start + chunk_chars >= len(text):
             break
+        start += stride
     return chunks
 
 
@@ -195,7 +202,7 @@ def build_index(
 
         for doc in tqdm(iter_corpus(limit=limit), desc="chunking+embedding"):
             already_done = done.get(doc["docid"])
-            chunks = chunk_text(doc["text"], config.chunk_words, config.chunk_overlap_words)
+            chunks = chunk_text(doc["text"], config.chunk_chars, config.chunk_overlap_chars)
             for ci, chunk in enumerate(chunks):
                 if already_done and ci in already_done:
                     continue
@@ -217,8 +224,8 @@ def build_index(
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump({
             "embed_model": config.embed_model,
-            "chunk_words": config.chunk_words,
-            "chunk_overlap_words": config.chunk_overlap_words,
+            "chunk_chars": config.chunk_chars,
+            "chunk_overlap_chars": config.chunk_overlap_chars,
             "num_chunks": int(matrix.shape[0]),
             "dim": int(matrix.shape[1]),
             "corpus_dataset": config.corpus_dataset,

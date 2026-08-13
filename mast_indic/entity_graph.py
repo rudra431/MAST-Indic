@@ -1,27 +1,60 @@
-"""In-memory entity relationship graph, built by `graph_builder.py`.
+"""In-memory entity relationship graph, loaded from a pre-extracted JSONL.
 
-Loads `index_store/relations.jsonl` -- (subject, relation, object, docid,
-chunk_id) rows extracted per chunk -- into an adjacency list keyed by
-lowercased entity name, for multi-hop lookups from
-`CorpusInteractionEngine.graph_search`. Each relation is indexed in both
-directions (subject->object and object->subject) so traversal finds an
-entity regardless of which side of the extracted sentence named it.
+Loads `index_store/entity_graph.jsonl` -- one JSON object per chunk, shaped
+like:
+
+    {
+      "doc_id": "41758__chunk_0001",
+      "entities": [{"id": "vikings", "name": "Vikings", "type": "Team"}, ...],
+      "concepts": [{"id": "concept_historical_drama", "name": "Historical Drama",
+                     "description": "...", "level": 1}, ...],
+      "triplets": [{"head": "Vikings", "relation": "aired_on", "tail": "History",
+                     "tail_is_concept": false}, ...]
+    }
+
+into an adjacency list keyed by lowercased name, for multi-hop lookups from
+`CorpusInteractionEngine.graph_search`. Each triplet is indexed in both
+directions (head->tail and tail->head) so traversal finds a node regardless
+of which side named it. `entities`/`concepts` are enrichment, not a strict
+node universe -- a triplet's `head`/`tail` can (and often does) name a
+string that never appears in either list; those are still valid graph nodes,
+just without a known `type`/`description`.
+
+This supersedes `graph_builder.py`'s own (much simpler) extraction format --
+see that module's docstring. Bring your own extraction pipeline that
+produces this shape; this module only loads and traverses it.
 
 This is a flat in-memory structure, not a graph database -- fine at the
-chunk/relation counts this project's LLM-based extraction produces (see
-`graph_builder.py`); swap in a real graph store (Neo4j, etc.) if you outgrow
-it.
+chunk/relation counts a single-pass extraction over this corpus produces;
+swap in a real graph store (Neo4j, etc.) if you outgrow it.
 """
 from __future__ import annotations
 
 import json
 import os
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 
 from .config import config
 
-RELATIONS_PATH_NAME = "relations.jsonl"
+ENTITY_GRAPH_PATH_NAME = "entity_graph.jsonl"
+
+# "{docid}__chunk_{NNNN}" (1-indexed, matching common chunk-export
+# conventions) -> (docid, chunk_id). The chunk_id conversion is best-effort:
+# `graph_search` already falls back to any chunk of the matched docid if the
+# specific chunk_id isn't found in this index's own `meta.jsonl`, so exact
+# alignment isn't required for correctness -- it only ever affects which of
+# a doc's chunks gets used as the source of the shown snippet/URL.
+_DOC_ID_RE = re.compile(r"^(.*)__chunk_(\d+)$")
+
+
+def _parse_doc_id(doc_id: str) -> tuple[str, int]:
+    match = _DOC_ID_RE.match(doc_id or "")
+    if not match:
+        return doc_id or "", 0
+    docid, chunk_num = match.group(1), int(match.group(2))
+    return docid, max(chunk_num - 1, 0)
 
 
 @dataclass
@@ -31,35 +64,58 @@ class GraphEdge:
     object: str
     docid: str
     chunk_id: int
+    object_is_concept: bool = False
 
 
 class EntityGraph:
-    """Adjacency list over extracted relation triples, loaded once at startup."""
+    """Adjacency list over extracted (head, relation, tail) triplets, loaded
+    once at startup, plus lowercased-name -> type/description lookups for
+    the entities and concepts the extraction recognized.
+    """
 
     def __init__(self, relations_path: str | None = None) -> None:
-        self.path = relations_path or os.path.join(config.index_dir, RELATIONS_PATH_NAME)
+        self.path = relations_path or os.path.join(config.index_dir, ENTITY_GRAPH_PATH_NAME)
         self.edges: list[GraphEdge] = []
         self.adjacency: dict[str, list[GraphEdge]] = defaultdict(list)
+        self.entity_types: dict[str, str] = {}
+        self.concept_descriptions: dict[str, str] = {}
         if not os.path.exists(self.path):
             return
+
         with open(self.path, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
                 row = json.loads(line)
-                edge = GraphEdge(
-                    subject=row["subject"], relation=row["relation"], object=row["object"],
-                    docid=row["docid"], chunk_id=row["chunk_id"],
-                )
-                self.edges.append(edge)
-                self.adjacency[edge.subject.lower()].append(edge)
-                # Index the reverse direction too, so a BFS starting from
-                # either side of the original sentence finds this edge.
-                self.adjacency[edge.object.lower()].append(GraphEdge(
-                    subject=edge.object, relation=f"<-{edge.relation}-", object=edge.subject,
-                    docid=edge.docid, chunk_id=edge.chunk_id,
-                ))
+                docid, chunk_id = _parse_doc_id(row.get("doc_id", ""))
+
+                for e in row.get("entities") or []:
+                    name = e.get("name")
+                    if name:
+                        self.entity_types[name.lower()] = e.get("type", "")
+                for c in row.get("concepts") or []:
+                    name = c.get("name")
+                    if name:
+                        self.concept_descriptions[name.lower()] = c.get("description", "")
+
+                for t in row.get("triplets") or []:
+                    head, relation, tail = t.get("head"), t.get("relation"), t.get("tail")
+                    if not (head and relation and tail):
+                        continue
+                    is_concept = bool(t.get("tail_is_concept"))
+                    edge = GraphEdge(
+                        subject=head, relation=relation, object=tail,
+                        docid=docid, chunk_id=chunk_id, object_is_concept=is_concept,
+                    )
+                    self.edges.append(edge)
+                    self.adjacency[head.lower()].append(edge)
+                    # Index the reverse direction too, so a BFS starting from
+                    # either side of the original triplet finds this edge.
+                    self.adjacency[tail.lower()].append(GraphEdge(
+                        subject=tail, relation=f"<-{relation}-", object=head,
+                        docid=docid, chunk_id=chunk_id, object_is_concept=False,
+                    ))
 
     @property
     def is_built(self) -> bool:
@@ -87,6 +143,7 @@ class EntityGraph:
                     found.append({
                         "subject": edge.subject, "relation": edge.relation, "object": edge.object,
                         "docid": edge.docid, "chunk_id": edge.chunk_id,
+                        "object_is_concept": edge.object_is_concept,
                     })
                     other = edge.object.lower()
                     if other not in visited:

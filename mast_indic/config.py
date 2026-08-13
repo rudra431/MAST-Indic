@@ -89,8 +89,12 @@ class Config:
         "MAST_QUERIES_DATASET", "mast-benchmark/indic-queries-2026"))
     index_dir: str = field(default_factory=lambda: os.environ.get(
         "MAST_INDEX_DIR", "index_store"))
-    chunk_words: int = field(default_factory=lambda: _int("MAST_CHUNK_WORDS", 220))
-    chunk_overlap_words: int = field(default_factory=lambda: _int("MAST_CHUNK_OVERLAP_WORDS", 40))
+    # Character-based chunking (index.py): sizes chunks directly against the
+    # embedding model's token budget via a 1-token-~4-characters
+    # approximation, rather than counting words. Defaults: 2048 tokens ~
+    # 8192 chars per chunk, 50 tokens ~ 200 chars overlap.
+    chunk_chars: int = field(default_factory=lambda: _int("MAST_CHUNK_CHARS", 8192))
+    chunk_overlap_chars: int = field(default_factory=lambda: _int("MAST_CHUNK_OVERLAP_CHARS", 200))
 
     # Agent loop / search tool
     max_turns: int = field(default_factory=lambda: _int("MAST_MAX_TURNS", 8))

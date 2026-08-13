@@ -74,8 +74,8 @@ class CorpusInteractionEngine:
         self._chunks_by_doc: dict[str, list[int]] = defaultdict(list)
         for i, m in enumerate(self.index.meta):
             self._chunks_by_doc[m["docid"]].append(i)
-        # Lazily loads index_store/relations.jsonl if present; graph_search
-        # simply returns nothing if graph_builder.py hasn't been run yet.
+        # Lazily loads index_store/entity_graph.jsonl if present; graph_search
+        # simply returns nothing if that file doesn't exist yet.
         self.entity_graph = entity_graph if entity_graph is not None else EntityGraph()
         self._build_inverted_index()
 
@@ -284,11 +284,14 @@ class CorpusInteractionEngine:
     def graph_search(self, entity: str, hops: int = 1) -> list[SearchHit]:
         """Traverse the entity relationship graph outward from `entity`.
 
-        Returns nothing if `graph_builder.py` hasn't been run for this
-        corpus. Results are deduped per source document (richest-in-relations
-        document first, up to `adjust_scale`'s current limit); the snippet is
-        the extracted relation(s) themselves rather than raw chunk text, so
-        the Executor sees *why* a document matched, not just that it did.
+        Returns nothing if `index_store/entity_graph.jsonl` doesn't exist for
+        this corpus (see `entity_graph.py`). Results are deduped per source
+        document (richest-in-relations document first, up to
+        `adjust_scale`'s current limit); the snippet is the extracted
+        relation(s) themselves rather than raw chunk text, so the Executor
+        sees *why* a document matched, not just that it did. A relation
+        whose tail is a concept (not a literal entity) is marked `[concept]`
+        so the Executor doesn't mistake it for another named entity to chase.
         """
         if not self.entity_graph.is_built:
             return []
@@ -306,7 +309,8 @@ class CorpusInteractionEngine:
         for docid in ranked_docids:
             doc_edges = per_doc[docid]
             relation_desc = "; ".join(
-                f'{e["subject"]} {e["relation"]} {e["object"]}' for e in doc_edges[:5]
+                f'{e["subject"]} {e["relation"]} {e["object"]}' + (" [concept]" if e.get("object_is_concept") else "")
+                for e in doc_edges[:5]
             )
             idxs = self._chunks_by_doc.get(docid, [])
             chunk_id = doc_edges[0]["chunk_id"]

@@ -17,8 +17,8 @@ mast_indic/
   interact_engine.py # Interact-RAG-style retrieval action primitives (arXiv:2510.27566)
   interact_agent.py  # agent loop using interact_engine.py instead of one `search` tool
   interact_runner.py # CLI: runs interact_agent.py over a language's queries -> submission JSONL
-  graph_builder.py    # CLI: extracts an entity relationship graph from the chunked corpus
-  entity_graph.py     # in-memory adjacency list loaded from graph_builder.py's output
+  entity_graph.py     # in-memory adjacency list loaded from index_store/entity_graph.jsonl (bring your own extraction)
+  graph_builder.py    # optional/legacy: LLM-extracts a simpler graph, but not the schema entity_graph.py reads
   export_corpus.py    # CLI: dumps each corpus document as its own Markdown file
   eval.py            # CLI: LLM-judge scoring of a run against gold answers
 scripts/
@@ -57,8 +57,9 @@ vLLM-hosted embedding model, set `MAST_EMBED_BASE_URL` to that server's
 ```
 
 This streams `Tevatron/browsecomp-plus-corpus`, splits each document into
-~220-word overlapping chunks, embeds every chunk via the configured
-embedding server, and writes:
+overlapping character-based chunks (default 8192 chars ≈ 2048 tokens, 200
+chars ≈ 50 tokens overlap, via a 1-token-≈-4-characters approximation),
+embeds every chunk via the configured embedding server, and writes:
 
 - `index_store/embeddings.npy` — L2-normalized float32 chunk vectors
 - `index_store/meta.jsonl` — one line per chunk: `{docid, chunk_id, url, text}`
@@ -71,7 +72,7 @@ re-chunking and re-embedding everything, and checkpoints `embeddings.npy`
 every 2000 newly-embedded chunks (`--checkpoint-every N` to change that) so
 a crash only costs the last checkpoint, not the whole run. Pass `--fresh` to
 ignore any existing index and rebuild from scratch (e.g. after changing
-`MAST_CHUNK_WORDS`/`MAST_EMBED_MODEL`).
+`MAST_CHUNK_CHARS`/`MAST_EMBED_MODEL`).
 
 **Scaling note:** the full corpus is ~100k docs / ~5,200 words average, so
 full-corpus indexing means embedding several hundred thousand chunks locally —
@@ -407,71 +408,80 @@ python -m mast_indic.eval \
 ### Entity relationship graph (`graph_search`)
 
 `graph_search` needs an actual graph built first -- it returns nothing
-until you do. Build one from an already-chunked corpus (`index.py build`
-must have run already, since this reuses `index_store/meta.jsonl` rather
-than re-streaming/re-chunking the raw corpus):
+until you do. Bring your own extraction (this project doesn't run one for
+you) and place it at `index_store/entity_graph.jsonl`, one JSON object per
+chunk:
 
-```bash
-./scripts/build_entity_graph.sh --limit 500   # dev-scale subset, a few minutes
-./scripts/build_entity_graph.sh                # full corpus (slow -- one LLM call per chunk)
+```json
+{
+  "doc_id": "41758__chunk_0001",
+  "entities": [{"id": "vikings", "name": "Vikings", "type": "Team"}, ...],
+  "concepts": [{"id": "concept_historical_drama", "name": "Historical Drama",
+                 "description": "Series set in specific historical periods...", "level": 1}, ...],
+  "triplets": [{"head": "Vikings", "relation": "aired_on", "tail": "History",
+                 "tail_is_concept": false}, ...]
+}
 ```
 
-For each chunk, this asks the chat LLM to extract `(subject, relation,
-object)` triples via a forced structured tool call (so output is always
-valid JSON, never parsed free text), and appends them to
-`index_store/relations.jsonl` with `(docid, chunk_id)` provenance.
-Completion is tracked per chunk in a separate `index_store/relations_progress.jsonl`
-sidecar file (not by presence in `relations.jsonl` itself, since a chunk
-with genuinely zero relations would otherwise look "not yet processed"
-forever) -- resumable the same way `build_index.sh` is: interrupt and rerun
-with the same command, and it skips chunks already recorded there; pass
-`--fresh` to ignore both files and rebuild from scratch. Override the
-extraction model with `MAST_GRAPH_MODEL` in `.env` (a cheaper/faster model
-than your main chat model is usually fine here).
-
-Chunks longer than `--max-chunk-chars` (default 1500; rarely triggered at
-this project's default `MAST_CHUNK_WORDS=220`, but relevant for
-`index.py`'s whitespace-less-text backstop or a larger configured chunk
-size) are split into smaller, slightly-overlapping windows before
-extraction rather than sent whole -- a single long wall of text both risks
-slow/timeout-prone LLM calls and tends to yield fewer, lower-quality
-relations than the same text extracted from focused passages. All windows
-of one chunk still count as a single unit of work for progress tracking.
+- `doc_id` is `"{docid}__chunk_NNNN"` (1-indexed) -- `entity_graph.py` splits
+  it back into `(docid, chunk_id)` to source a `graph_search` hit's URL and
+  provenance. Exact chunk-index alignment with this project's own
+  `index_store/meta.jsonl` isn't required for correctness: if the specific
+  chunk isn't found, it falls back to any chunk of the same `docid`.
+- `entities`/`concepts` are enrichment (types, descriptions), not a strict
+  node universe -- a `head`/`tail` naming something outside either list is
+  still a perfectly valid graph node, just without a known type/description.
+- `tail_is_concept` marks whether a triplet's tail refers to something in
+  `concepts` rather than a literal named entity; `graph_search` surfaces
+  this as a `[concept]` tag on the relation so the Executor doesn't mistake
+  a concept for another entity worth chasing further.
 
 `entity_graph.py` loads that file into an in-memory adjacency list, indexed
-in both directions (subject→object and object→subject) so a lookup finds an
-entity regardless of which side of the extracted sentence named it. The
-agent's `graph_search(entity, hops)` action (1-3 hops) BFS-traverses it and
-turns each nearby relation back into a source-chunk hit, deduped per
-document, with the relation itself as the snippet (e.g. `"Lady Shri Ram
-College founded_by Lajjawati Suri"`) rather than raw chunk text -- so the
-Executor sees *why* a document matched.
+in both directions (head→tail and tail→head) so a lookup finds a node
+regardless of which side of the triplet named it. The agent's
+`graph_search(entity, hops)` action (1-3 hops) BFS-traverses it and turns
+each nearby relation back into a source-chunk hit, deduped per document,
+with the relation itself as the snippet (e.g. `"Vikings aired_on History;
+Vikings distributed_on Prime Video"`) rather than raw chunk text -- so the
+Executor sees *why* a document matched. Multi-hop genuinely resolves in one
+call this way (entity → relation → entity → relation → entity), which is
+the whole reason this action exists alongside the text-search ones.
 
-**This is LLM-based extraction, not a trained NER/relation-extraction
-model** -- consistent with this project's "flat file, brute force,
-dev-scale" approach elsewhere. Expect it to be noisy and non-exhaustive: no
-entity canonicalization is attempted (the same entity phrased two different
-ways across chunks won't merge), relations can be missed, and the model can
-occasionally extract one despite the prompt telling it not to invent facts.
+**This is only as good as your own extraction pipeline** -- `entity_graph.py`
+just loads and traverses whatever you hand it; expect the usual
+LLM/NER-extraction caveats (missed relations, inconsistent entity naming
+across chunks since no canonicalization is attempted here, occasional
+hallucinated relations) to be whatever your own pipeline's caveats are.
 Treat `graph_search` results as a pointer back to a real chunk worth
-verifying, not as ground truth. If `index_store/relations.jsonl` doesn't
+verifying, not as ground truth. If `index_store/entity_graph.jsonl` doesn't
 exist, `graph_search` just returns an empty list and the agent falls back
 to `entity_match`/`exact_search` (both prompts say to do this).
+
+`graph_builder.py`/`scripts/build_entity_graph.sh` are a self-contained,
+optional LLM-extraction pipeline (asks the chat model for plain
+`(subject, relation, object)` triples per chunk) kept here in case you don't
+have your own -- but its output (`index_store/relations.jsonl`, the older,
+simpler schema) is a different shape than `entity_graph.jsonl` above and
+needs its own loader if you want to use it; `entity_graph.py` no longer
+reads it directly.
 
 ## What's stubbed vs. real
 
 - **Real**: corpus loading, chunking, batch embedding, cosine search,
   all three tool-calling agent loops (dense-only, sparse-only, and
-  Interact-RAG-style), LLM-based entity-relationship graph extraction and
-  multi-hop traversal (`graph_builder.py`/`entity_graph.py`), JSONL output, and LLM-judge answer
+  Interact-RAG-style), entity-relationship graph loading and multi-hop
+  traversal (`entity_graph.py`, plus an optional/legacy LLM-extraction
+  pipeline in `graph_builder.py`), JSONL output, and LLM-judge answer
   scoring (`mast_indic/eval.py`) — Accuracy, Exact Match, F1, and
   calibration error.
 - **Not included**: Interact-RAG's SFT+RL training pipeline — `interact_agent.py`
   is a zero-shot, prompted reproduction of its interaction interface only,
-  not a trained policy (see above). The entity graph is LLM-extracted, not
-  built from a trained NER/relation-extraction model, and has no entity
-  canonicalization (see the graph section above) — treat it as a hint, not
-  ground truth. Also not included: retrieval recall and citation
+  not a trained policy (see above). The entity graph's *extraction* isn't
+  this project's responsibility -- `entity_graph.py` only loads and
+  traverses whatever `index_store/entity_graph.jsonl` you provide (see the
+  graph section above); treat `graph_search` results as a hint pointing
+  back to a real chunk, not ground truth. Also not included: retrieval
+  recall and citation
   precision/recall against qrels — there are no relevance-judgment files
   for the Indic queries, so `eval.py` only scores final-answer correctness.
   If real qrels become available, see the BrowseComp-Plus repo's

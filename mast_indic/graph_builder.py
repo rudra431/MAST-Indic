@@ -1,13 +1,21 @@
 """Build an entity-relationship graph over an already-chunked corpus.
 
+SUPERSEDED: `entity_graph.py` now loads a richer, externally-produced
+schema (typed entities, concepts, and head/relation/tail triplets, keyed by
+a compound `"{docid}__chunk_NNNN"` id) from `index_store/entity_graph.jsonl`
+-- see that module's docstring. This script's own output
+(`index_store/relations.jsonl`, plain `(subject, relation, object)` triples)
+is no longer what `CorpusInteractionEngine.graph_search` reads. Kept here
+as a standalone, self-contained extraction pipeline in case you don't have
+your own -- but its output needs its own loader if you want to use it (this
+module doesn't write `entity_graph.jsonl`'s shape).
+
 Reads `index_store/meta.jsonl` (written by `python -m mast_indic.index
 build`) and asks the chat LLM to extract `(subject, relation, object)`
 triples from each chunk's text, via a forced structured tool call so output
 is always valid JSON rather than parsed free text. Writes one line per
 extracted triple to `index_store/relations.jsonl`, tagged with the
-(docid, chunk_id) it came from for provenance. `entity_graph.py` loads that
-file into an in-memory adjacency list for
-`CorpusInteractionEngine.graph_search`.
+(docid, chunk_id) it came from for provenance.
 
 This is LLM-based extraction, not a trained NER/relation-extraction model --
 consistent with this project's "flat file, brute force, dev-scale" approach
@@ -17,12 +25,12 @@ chunks (no canonicalization is attempted), or occasionally hallucinate one
 despite the prompt. Treat `graph_search` results as a hint that points back
 to a real chunk to verify, not as ground truth.
 
-Large chunks (index.py's `MAX_CHUNK_CHARS` backstop allows up to 4000 chars
-for whitespace-less text, and a larger `MAST_CHUNK_WORDS` can produce long
-chunks too) are split into smaller, slightly-overlapping windows before
-extraction -- a single long wall of text sent to the LLM both risks slow
-generation / timeouts and tends to yield fewer, lower-quality extracted
-relations than the same text split into focused passages (see `--max-chunk-chars`).
+Large chunks (index.py's `MAST_CHUNK_CHARS` default is 8192 characters --
+~2048 tokens -- per chunk) are split into smaller, slightly-overlapping
+windows before extraction -- a single long wall of text sent to the LLM
+both risks slow generation / timeouts and tends to yield fewer,
+lower-quality extracted relations than the same text split into focused
+passages (see `--max-chunk-chars`).
 
 Running an LLM over every chunk in a large corpus is expensive and slow --
 resumable and checkpointed the same way `index.py`'s `build_index` is, and
@@ -89,8 +97,10 @@ def _split_for_extraction(text: str, max_chars: int) -> list[str]:
     A word-level split (not a hard character cut) so windows stay readable;
     a small overlap keeps a relation whose subject/object straddle a split
     point from being cut in half. No-ops (returns `[text]`) for chunks
-    already under `max_chars`, which is the common case at this project's
-    default `MAST_CHUNK_WORDS=220`.
+    already under `max_chars` -- at this project's default
+    `MAST_CHUNK_CHARS=8192`, most chunks now exceed `--max-chunk-chars`
+    (default 1500) and DO get split; this used to be the rare case back
+    when chunks were sized in ~220 words (~1200-1400 chars).
     """
     if len(text) <= max_chars:
         return [text]
