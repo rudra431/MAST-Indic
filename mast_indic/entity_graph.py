@@ -49,12 +49,25 @@ ENTITY_GRAPH_PATH_NAME = "entity_graph.jsonl"
 _DOC_ID_RE = re.compile(r"^(.*)__chunk_(\d+)$")
 
 
-def _parse_doc_id(doc_id: str) -> tuple[str, int]:
-    match = _DOC_ID_RE.match(doc_id or "")
+def _parse_doc_id(doc_id) -> tuple[str, int]:
+    if not isinstance(doc_id, str):
+        return "", 0
+    match = _DOC_ID_RE.match(doc_id)
     if not match:
-        return doc_id or "", 0
+        return doc_id, 0
     docid, chunk_num = match.group(1), int(match.group(2))
     return docid, max(chunk_num - 1, 0)
+
+
+def _clean_str(value) -> str | None:
+    """Returns a stripped non-empty string, or None for anything else
+    (missing, wrong type, or blank) -- the extraction is externally
+    produced and its field types aren't guaranteed, so every value coming
+    out of it gets validated here rather than assumed."""
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value or None
 
 
 @dataclass
@@ -82,26 +95,58 @@ class EntityGraph:
         if not os.path.exists(self.path):
             return
 
+        skipped_lines = 0
+        skipped_triplets = 0
+        total_lines = 0
+        total_triplets = 0
+
         with open(self.path, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
-                row = json.loads(line)
-                docid, chunk_id = _parse_doc_id(row.get("doc_id", ""))
+                total_lines += 1
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    skipped_lines += 1
+                    continue
+                if not isinstance(row, dict):
+                    skipped_lines += 1
+                    continue
+
+                docid, chunk_id = _parse_doc_id(row.get("doc_id"))
 
                 for e in row.get("entities") or []:
-                    name = e.get("name")
+                    if not isinstance(e, dict):
+                        continue
+                    name = _clean_str(e.get("name"))
                     if name:
-                        self.entity_types[name.lower()] = e.get("type", "")
+                        etype = _clean_str(e.get("type")) or ""
+                        self.entity_types[name.lower()] = etype
                 for c in row.get("concepts") or []:
-                    name = c.get("name")
+                    if not isinstance(c, dict):
+                        continue
+                    name = _clean_str(c.get("name"))
                     if name:
-                        self.concept_descriptions[name.lower()] = c.get("description", "")
+                        desc = _clean_str(c.get("description")) or ""
+                        self.concept_descriptions[name.lower()] = desc
 
                 for t in row.get("triplets") or []:
-                    head, relation, tail = t.get("head"), t.get("relation"), t.get("tail")
+                    if not isinstance(t, dict):
+                        skipped_triplets += 1
+                        continue
+                    total_triplets += 1
+                    head = _clean_str(t.get("head"))
+                    relation = _clean_str(t.get("relation"))
+                    tail = _clean_str(t.get("tail"))
                     if not (head and relation and tail):
+                        # Malformed triplet (wrong field type -- e.g. a
+                        # literal `true`/`false` where a string was
+                        # expected -- or a missing head/relation/tail).
+                        # Skip it rather than crash the whole load; this is
+                        # externally-produced data of unknown quality.
+                        skipped_triplets += 1
                         continue
                     is_concept = bool(t.get("tail_is_concept"))
                     edge = GraphEdge(
@@ -116,6 +161,14 @@ class EntityGraph:
                         subject=tail, relation=f"<-{relation}-", object=head,
                         docid=docid, chunk_id=chunk_id, object_is_concept=False,
                     ))
+
+        if skipped_lines or skipped_triplets:
+            print(
+                f"[entity_graph] loaded {total_lines - skipped_lines}/{total_lines} line(s), "
+                f"{total_triplets - skipped_triplets}/{total_triplets} triplet(s) "
+                f"-- skipped {skipped_lines} malformed line(s) and {skipped_triplets} "
+                f"malformed triplet(s) from {self.path}"
+            )
 
     @property
     def is_built(self) -> bool:

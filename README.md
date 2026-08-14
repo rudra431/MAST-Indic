@@ -240,7 +240,7 @@ keywords/names/phrases rather than paraphrased natural-language questions.
 (mirroring `interact_agent.py`'s Global-Planner, sharing its
 `MAST_PLANNER_MODEL` config) decomposes the question into a list of ATOMIC
 sub-queries -- short keyword-style phrases, one per distinguishing fact
-(e.g. `"founded 1949 1959"`, `"Lady Shri Ram College"`), not the kind of
+(e.g. `"founded 1962"`, `"Acme Manufacturing Corp"`), not the kind of
 broader sub-questions a general planner would produce, since exact_search
 specifically needs something already shaped like a usable keyword query.
 The plan is logged in `result` (tagged `role: "planner"`) and injected into
@@ -276,19 +276,24 @@ Interaction actions live in `interact_engine.py`, on top of the same
 - `semantic_search(query)` — dense embedding retrieval (what `agent.py`'s
   `search` tool does)
 - `exact_search(keywords)` — sparse retrieval, real Okapi BM25 over an
-  in-memory inverted index built once per engine instance (term-frequency
-  saturation + document-length normalization + IDF — see the module
-  docstring for why that matters over a naive keyword-count)
+  inverted index (term-frequency saturation + document-length normalization
+  + IDF — see the module docstring for why that matters over a naive
+  keyword-count). Building it is an O(corpus size) tokenization pass, so
+  it's cached to `index_dir/inverted_index.pkl` and reloaded on the next
+  process start rather than redone from scratch on every run; the cache
+  self-invalidates (falls back to rebuilding) if `meta.jsonl`'s mtime or
+  chunk count no longer match what was cached, e.g. after a corpus rebuild
 - `boolean_search(and_terms, or_terms, not_terms)` — exact AND/OR/NOT set
   retrieval over the same inverted index, with **no ranking**: every match
   is equally valid. For when you need strict logical control rather than a
   best-guess ranking
 - `weighted_fusion(query, w_semantic, w_exact)` — blends dense with BM25
   for one query
-- `entity_match(entity)` — ranks chunks by literal mentions of a named
-  entity, dense similarity only breaking ties
 - `graph_search(entity, hops)` — multi-hop traversal of a pre-built entity
-  relationship graph (see below); returns nothing until you build one
+  relationship graph (see below), from a named entity outward; the go-to
+  action once you have a specific entity name, since (unlike every other
+  action here) it can resolve a chain of relations in one call. Returns
+  nothing until you build a graph
 - `include_docs(doc_ids)` / `exclude_docs(doc_ids)` — pin or filter specific
   documents across the rest of that query's retrievals
 - `adjust_scale(n)` — changes how many chunks come back per retrieval
@@ -340,26 +345,48 @@ word repeated many times in one irrelevant document (e.g. a dictionary
 entry) can outrank a genuinely relevant chunk that only mentions it once.
 The prompts push toward decomposing a multi-constraint question into one
 distinguishing sub-fact per turn, short single-concept queries for
-`semantic_search`, and short exact phrases/names/numbers for
-`exact_search`/`entity_match` rather than descriptive paraphrases.
+`semantic_search`, short exact phrases/names/numbers for `exact_search`
+rather than descriptive paraphrases, and reaching for `graph_search` (not
+another `exact_search`) once a specific named entity is already known.
 
-**Bounded evidence context:** every turn's search results get appended to
-an evidence log that's restated to the Reasoner on the *next* turn so it
-can judge what's been found so far. Restating the full history unbounded
-would grow with turn count and can overflow the model's context window on
-a long-running query -- or even from a single oversized `adjust_scale` call
-(up to 50 chunks x ~400-word snippets is ~26k tokens by itself). Past
-`MAST_EVIDENCE_CHAR_BUDGET` (default 60000 characters), older rounds are
-dropped first (noted as `"N earlier search round(s) omitted"`); a single
-round that alone exceeds the budget is hard-truncated rather than dropped,
-so the Reasoner always sees at least the most recent result. This only
-bounds what's sent to the LLM -- the full evidence still ends up in the
-run's own `result`/`transcript` trace.
+**Overcompound query guard:** telling the model not to concatenate
+constraints doesn't always work -- a weaker model can ignore that guidance
+and burn an entire run re-issuing cosmetic rewordings of the same multi-
+clause question (observed on a real trace: 50+ `semantic_search` calls, all
+restating one 5-constraint question, none of them converging, since dense
+retrieval collapses that whole sentence into one vector that's diluted
+toward *any* one clause rather than sharp on the document satisfying all of
+them). `interact_agent.py`'s `_dispatch` now rejects `semantic_search`/
+`weighted_fusion` queries that look overcompound (`_overcompound_query_error`
+-- longer than 14 words or more than 3 comma/and/or-separated clauses)
+before they ever reach the engine, returning an error explaining why and
+pushing the Executor to split the question into single-fact searches
+instead. This is a blunt heuristic, not a real parser: it reliably catches
+comma-separated lists of constraints but can miss an equally overcompound
+query that omits punctuation (e.g. a run of nouns with no "and"/comma
+between them). `exact_search`/`boolean_search` aren't gated the same way --
+BM25 doesn't dilute the same way dense retrieval does, so more terms mostly
+just narrows the match rather than blurring it.
+
+**Scratchpad instead of raw evidence:** rather than restating every turn's
+raw search results to the Reasoner on the next turn, a dedicated
+scratchpad-writer call (its own model/prompt, not reused from the Executor's
+own call) condenses each turn's tool call(s) and their output into a short
+`Goal:`/`Observations:`/`Achieved:`/`Next Steps:` note. That note -- not the
+raw output -- is what the Reasoner reads on subsequent turns. Restating raw
+history unbounded would grow with turn count and can overflow the model's
+context window on a long-running query -- or even from a single oversized
+`adjust_scale` call (up to 50 chunks x ~400-word snippets is ~26k tokens by
+itself); condensed notes stay small regardless of turn count, so there's no
+character budget or truncation/dropping to reason about. This only changes
+what's sent to the LLM -- the full raw tool output still ends up in the
+run's own `result`/`transcript` trace, alongside the note itself (tagged
+`role: "executor"`, `model: MAST_SCRATCHPAD_MODEL`).
 
 Each role defaults to `MAST_CHAT_MODEL`, but can be pointed at its own model
-via `MAST_PLANNER_MODEL` / `MAST_REASONER_MODEL` / `MAST_EXECUTOR_MODEL` in
-`.env` (e.g. a cheap model for planning, a stronger one for reasoning) — see
-`config.py`.
+via `MAST_PLANNER_MODEL` / `MAST_REASONER_MODEL` / `MAST_EXECUTOR_MODEL` /
+`MAST_SCRATCHPAD_MODEL` in `.env` (e.g. a cheap model for planning, a
+stronger one for reasoning) — see `config.py`.
 
 **Tracing what each role did:** every step lands in the run JSONL's `result`
 field (always written, no flag needed) tagged with `role`
@@ -379,6 +406,14 @@ search results with scores/snippets, and the final answer, all rendered
 turn by turn. Nothing leaves the browser; it reads the file locally via the
 File API. Passing `--save-transcripts` when generating the run lets it also
 show the original question text inline.
+
+**Visualizing an *eval* trace:** `tools/eval_trace_viewer.html` is a separate,
+equally standalone viewer for the eval harness's own per-task record shape
+(`{task_id, question, generated_answer, eval_trajectory: [...], ...}`) rather
+than `interact_agent.py`'s own run-log format above -- drop or paste one
+task's JSON onto it to walk through the same Planner → Reasoner → Executor
+turns, including tool-call arguments, the raw `<passage_N>` hits a tool
+result returned, per-turn scratchpad notes, and the final `generated_answer`.
 
 **What this is not:** the paper trains its agent (SFT on synthetic
 trajectories, then GRPO) to use these three roles well. There's no training
@@ -454,8 +489,9 @@ across chunks since no canonicalization is attempted here, occasional
 hallucinated relations) to be whatever your own pipeline's caveats are.
 Treat `graph_search` results as a pointer back to a real chunk worth
 verifying, not as ground truth. If `index_store/entity_graph.jsonl` doesn't
-exist, `graph_search` just returns an empty list and the agent falls back
-to `entity_match`/`exact_search` (both prompts say to do this).
+exist (or has no valid triplets), `graph_search` isn't offered to the
+Executor as a tool at all -- the agent falls back to `exact_search` instead
+(both prompts say to do this).
 
 `graph_builder.py`/`scripts/build_entity_graph.sh` are a self-contained,
 optional LLM-extraction pipeline (asks the chat model for plain

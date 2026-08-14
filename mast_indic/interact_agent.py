@@ -23,7 +23,18 @@ narrating all three roles in a single call:
   formulate the final answer -- matching the paper's actual control flow,
   where the Executor (not the Reasoner) is the one that concludes.
 
-The one deliberate deviation from the paper: its Executor's final answer is
+Beyond those three, there's a fourth, smaller call added on top of the
+paper's design: after the Executor's tool call(s) each turn, a short LLM
+call (`_run_scratchpad`) condenses that turn's goal and raw tool output into
+a compact note -- `Goal:`/`Observations:`/`Achieved:`/`Next Steps:` -- which
+is what the Adaptive-Reasoner reads on the *next* turn instead of the raw
+tool output. This isn't part of the published pipeline; it's a bounded-memory
+fix for a real failure mode (a long-running query's raw evidence either grows
+past the model's context window, or gets silently dropped once it does) --
+a note is a few sentences regardless of how many chunks a search returned,
+so nothing needs to be truncated as turns accumulate.
+
+The one deliberate deviation from the paper's *published* roles: its Executor's final answer is
 just "concise and direct words," but ours must end with fixed
 `Explanation:`/`Exact Answer:` lines, since `mast_indic/eval.py` depends on
 that format to score answers. Termination is still guaranteed the same way
@@ -32,9 +43,9 @@ that format to score answers. Termination is still guaranteed the same way
 answer in text.
 
 Each role can optionally run on its own model (`MAST_PLANNER_MODEL` /
-`MAST_REASONER_MODEL` / `MAST_EXECUTOR_MODEL` in `config.py`); all three
-default to `MAST_CHAT_MODEL` if unset, so nothing changes unless you split
-them out.
+`MAST_REASONER_MODEL` / `MAST_EXECUTOR_MODEL` / `MAST_SCRATCHPAD_MODEL` in
+`config.py`); all four default to `MAST_CHAT_MODEL` if unset, so nothing
+changes unless you split them out.
 
 This is a zero-shot, prompted reproduction of the paper's *interaction
 interface and module split* -- there's no SFT+RL training pipeline here,
@@ -121,12 +132,14 @@ C) Reflect & Refine: choose this if the previous search was ineffective (irrelev
    Then propose a refined search action with improved parameters -- account for how \
    the retrieval modes actually behave: dense/semantic_search embeds the whole query \
    into one vector, so a long sentence chaining unrelated constraints together dilutes \
-   into a vague, often-wrong match; sparse/exact_search and entity_match are literal \
-   keyword matching (BM25-ranked -- graded by relevance, not just presence), good for \
-   a name/number/exact phrase; boolean_search is also literal keyword matching but with \
-   NO ranking at all, useful when you need strict AND/OR/NOT control rather than a \
-   best-guess match. If a sub-task remains unresolved after 3 attempts, consider moving \
-   on to the next one.
+   into a vague, often-wrong match; sparse/exact_search is literal keyword matching \
+   (BM25-ranked -- graded by relevance, not just presence), good for a name/number/exact \
+   phrase; boolean_search is also literal keyword matching but with NO ranking at all, \
+   useful when you need strict AND/OR/NOT control rather than a best-guess match. Once a \
+   specific named entity is known, prefer graph_search over another exact_search on that \
+   same entity -- it can resolve a chain of relations (who founded X, what else did X \
+   found, who else is connected to X) in one call instead of one hop at a time. If a \
+   sub-task remains unresolved after 3 attempts, consider moving on to the next one.
 
 Do not include your uncommon internal knowledge in this analysis, as it may be \
 inaccurate -- only reason about the evidence log below.
@@ -178,14 +191,16 @@ when taking action 1 above):
   unconstrained to be useful).
 - weighted_fusion(query, w_semantic, w_exact): blend dense and BM25 scoring \
   for one query when neither alone is enough (weights need not sum to 1).
-- entity_match(entity): retrieve chunks that literally mention a specific \
-  named entity -- use when you need everything about "that person/place/org."
 - graph_search(entity, hops): traverse a pre-built entity relationship graph \
-  outward from a named entity (1-3 hops) -- use for explicit relationship \
-  questions ("who founded X", "what else did X found", "who else is \
-  connected to X") once you have a specific entity name. Returns nothing if \
-  the graph hasn't been built for this corpus; fall back to entity_match or \
-  exact_search if so.
+  outward from a named entity (1-3 hops) -- this is the go-to action once \
+  you have a specific entity name, for explicit relationship questions \
+  ("who founded X", "what else did X found", "who else is connected to X") \
+  and for hopping onto a second fact about an entity you've already found \
+  (e.g. you've identified a company's founder as a named person -- now \
+  traverse outward from them to find where they were born). It can resolve \
+  a multi-hop chain in one call, \
+  unlike the keyword/embedding actions above. Returns nothing if the graph \
+  hasn't been built for this corpus; fall back to exact_search if so.
 - include_docs(doc_ids): pin specific document IDs so they're guaranteed to \
   appear in later retrievals (e.g. a document you've already confirmed is \
   relevant).
@@ -199,18 +214,18 @@ action is good at -- do not just restate the Reasoner's full analysis \
 verbatim:
 - semantic_search(query): a short, single-concept natural-language phrase \
   (roughly 5-15 words), written the way you'd ask a person or type into a \
-  search box. NEVER a structured/SQL-like expression -- bad: "institution \
-  WHERE founded_year BETWEEN 1949 AND 1959 AND alumni_type = minister"; \
-  good: "college founded in the 1950s whose alumni became government \
-  ministers". Never concatenate multiple unrelated constraints (dates, \
-  alumni types, distances, etc.) into one query either, structured or not \
-  -- that dilutes the embedding and returns vaguely-related noise instead \
-  of a precise match.
-- exact_search(keywords) / entity_match(entity): a short exact phrase, \
-  proper noun, number, or date you expect to appear verbatim in the corpus. \
-  Avoid long descriptive phrases here -- a common word repeated many times \
-  in an unrelated document can outrank a genuinely relevant chunk that only \
-  mentions it once.
+  search box. NEVER a structured/SQL-like expression -- bad: "restaurant \
+  WHERE cuisine = Italian AND city = Chicago AND price_range = expensive"; \
+  good: "upscale Italian restaurant in Chicago". Never concatenate multiple \
+  unrelated constraints (dates, categories, locations, etc.) into one query \
+  either, structured or not -- that dilutes the embedding and returns \
+  vaguely-related noise instead of a precise match.
+- exact_search(keywords): a short exact phrase, proper noun, number, or \
+  date you expect to appear verbatim in the corpus. Avoid long descriptive \
+  phrases here -- a common word repeated many times in an unrelated \
+  document can outrank a genuinely relevant chunk that only mentions it once.
+- graph_search(entity, hops): just the entity name itself, exactly as it \
+  appeared in an earlier result -- not a question or descriptive phrase.
 - boolean_search(and_terms, or_terms, not_terms): each entry should be one \
   word or short phrase, not a sentence -- e.g. and_terms=["bank", "ceo"], \
   not_terms=["dictionary"]. Only use this when the Reasoner's analysis (or \
@@ -227,6 +242,25 @@ rest for a later turn -- unless it explicitly proposed two independent \
 parallel searches, in which case call both.
 """
 
+# Not one of the paper's three modules -- an addition on top (see the module
+# docstring) that turns each turn's raw tool output into a compact note the
+# Adaptive-Reasoner reads instead, so its context stays small and concrete
+# no matter how many turns a query takes.
+SCRATCHPAD_SYSTEM_PROMPT = """You maintain the running scratchpad for an \
+Interact-RAG-style research pipeline (MAST @ FIRE 2026, Track 2: Indic). You will be \
+given the current turn's goal (what the Executor was trying to find or verify) and the \
+tool call(s) it made along with their raw results. Condense this turn's outcome into a \
+compact note -- the Adaptive-Reasoner reads your notes turn by turn instead of the raw \
+results, so be concrete about what was actually found (names, dates, docids), not just \
+that a search "was run."
+
+Output exactly four lines, in this format, and nothing else:
+Goal: <one sentence -- what this turn was trying to find or verify>
+Observations: <what the tool result(s) actually showed, concretely>
+Achieved: yes|partial|no -- <one short clause on why>
+Next Steps: <what to try next, or "none -- ready to conclude" if the whole question is answered>
+"""
+
 INTERACT_TOOLS = [
     {
         "type": "function",
@@ -236,11 +270,11 @@ INTERACT_TOOLS = [
                 "Dense embedding retrieval: ranks chunks by conceptual similarity to a "
                 "natural-language query. `query` must be plain prose, written the way "
                 "a person would ask it or type it into a search box -- NEVER a "
-                "structured/SQL-like expression. Bad: \"institution WHERE "
-                "founded_year BETWEEN 1949 AND 1959 AND alumni_type = minister\". "
-                "Good: \"college founded in the 1950s whose alumni became government "
-                "ministers\". Best for a single, self-contained factual question or a "
-                "paraphrase-tolerant lookup. Weak on complex multi-hop questions that "
+                "structured/SQL-like expression. Bad: \"restaurant WHERE cuisine = "
+                "Italian AND city = Chicago AND price_range = expensive\". "
+                "Good: \"upscale Italian restaurant in Chicago\". Best for a single, "
+                "self-contained factual question or a paraphrase-tolerant lookup. "
+                "Weak on complex multi-hop questions that "
                 "chain several linked facts in one query -- it embeds the whole query "
                 "into one vector, so packing multiple sub-facts together (structured "
                 "or not) dilutes rather than resolves them; resolve one hop per call "
@@ -330,37 +364,17 @@ INTERACT_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "entity_match",
-            "description": (
-                "Retrieves chunks that literally mention a specific named entity, "
-                "ranked by mention frequency. Best for hopping onto a *second* fact "
-                "once an entity is already known from an earlier result (e.g. found "
-                "'Lala Shri Ram' as a founder -- now pull everything mentioning him to "
-                "find his birthplace). Not useful as a first search before any entity "
-                "is identified, and matching is literal -- a typo, alias, or "
-                "translated form of the name won't match."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "entity": {"type": "string", "description": "The entity name to search for, in English."},
-                },
-                "required": ["entity"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "graph_search",
             "description": (
                 "Traverses a pre-built entity relationship graph outward from a named "
-                "entity, 1-3 hops. Unlike every other search action here, this CAN "
-                "resolve a multi-hop chain (entity -> relation -> entity -> relation -> "
-                "entity) in a single call, when the graph has been built for this "
-                "corpus -- it returns nothing if not, so fall back to entity_match or "
-                "exact_search then. The graph is LLM-extracted and may be incomplete, "
-                "so an empty result doesn't prove a relationship doesn't exist."
+                "entity, 1-3 hops. This is the go-to action once you have a specific "
+                "named entity: unlike every other search action here, it CAN resolve a "
+                "multi-hop chain (entity -> relation -> entity -> relation -> entity) in "
+                "a single call, and its snippets are the extracted relations themselves "
+                "rather than raw chunk text, so you see exactly why a document matched. "
+                "It returns nothing if the graph hasn't been built for this corpus -- "
+                "fall back to exact_search then. The graph is LLM-extracted and may be "
+                "incomplete, so an empty result doesn't prove a relationship doesn't exist."
             ),
             "parameters": {
                 "type": "object",
@@ -434,14 +448,53 @@ INTERACT_TOOLS = [
 # Actions that retrieve evidence (tracked in retrieved_docids); the rest
 # (include_docs/exclude_docs/adjust_scale) only mutate interaction state.
 RETRIEVAL_ACTIONS = {
-    "semantic_search", "exact_search", "boolean_search", "weighted_fusion", "entity_match", "graph_search",
+    "semantic_search", "exact_search", "boolean_search", "weighted_fusion", "graph_search",
 }
+
+# Dense retrieval embeds the whole query into one vector -- packing several
+# constraints into one query string ("X founded in Y, alumni A, B, C, and D")
+# dilutes that vector toward a generic match for *any* one clause instead of
+# a sharp match for the document satisfying *all* of them. The tool
+# descriptions and Executor prompt already tell the model not to do this,
+# but a model that ignores that guidance can burn an entire run re-issuing
+# the same overcompound query with cosmetic rewording (observed on real
+# traces: 50+ semantic_search calls, all restatements of one 5-clause
+# question, none of them converging). This is a blunt backstop, not a real
+# parser -- word count + comma/and/or clause count -- so it only catches the
+# common "long list of constraints" shape, not every way a query can be too
+# broad.
+_MAX_QUERY_WORDS = 14
+_MAX_QUERY_CLAUSES = 3
+_CLAUSE_SPLIT_RE = re.compile(r",|\band\b|\bor\b", re.IGNORECASE)
+
+
+def _overcompound_query_error(query: str) -> str | None:
+    """Returns an error message if `query` packs multiple constraints into
+    one search string, or None if it looks like a single atomic query."""
+    words = query.split()
+    clauses = len([c for c in _CLAUSE_SPLIT_RE.split(query) if c.strip()])
+    if len(words) <= _MAX_QUERY_WORDS and clauses <= _MAX_QUERY_CLAUSES:
+        return None
+    preview = " ".join(words[:12]) + ("..." if len(words) > 12 else "")
+    return (
+        f'query rejected as overcompound: "{preview}" packs multiple facts '
+        "into one search. Dense retrieval embeds the whole query into a "
+        "single vector, so combining several constraints dilutes it into a "
+        "vague match instead of resolving any one precisely. Split this into "
+        "separate single-fact searches (one per date/entity/attribute) and "
+        "narrow down using include_docs/exclude_docs across turns, rather "
+        "than combining constraints into one query."
+    )
 
 
 def _dispatch(engine: CorpusInteractionEngine, name: str, args: dict) -> tuple[str, list[str]]:
     """Run one action against the engine; returns (tool_output_text, docids)."""
     if name == "semantic_search":
-        hits = engine.semantic_search(args.get("query", ""))
+        query = args.get("query", "")
+        error = _overcompound_query_error(query)
+        if error:
+            return json.dumps({"error": error}), []
+        hits = engine.semantic_search(query)
     elif name == "exact_search":
         hits = engine.exact_search(args.get("keywords", ""))
     elif name == "boolean_search":
@@ -451,13 +504,15 @@ def _dispatch(engine: CorpusInteractionEngine, name: str, args: dict) -> tuple[s
             not_terms=args.get("not_terms") or [],
         )
     elif name == "weighted_fusion":
+        query = args.get("query", "")
+        error = _overcompound_query_error(query)
+        if error:
+            return json.dumps({"error": error}), []
         hits = engine.weighted_fusion(
-            args.get("query", ""),
+            query,
             float(args.get("w_semantic", 0.5)),
             float(args.get("w_exact", 0.5)),
         )
-    elif name == "entity_match":
-        hits = engine.entity_match(args.get("entity", ""))
     elif name == "graph_search":
         hits = engine.graph_search(args.get("entity", ""), int(args.get("hops", 1) or 1))
     elif name == "include_docs":
@@ -477,42 +532,16 @@ def _dispatch(engine: CorpusInteractionEngine, name: str, args: dict) -> tuple[s
     return json.dumps(payload, ensure_ascii=False), docids
 
 
-def _format_evidence(evidence_log: list[dict], char_budget: int = None) -> str:
-    """Renders evidence_log within a hard character budget, newest-first
-    priority. Without a cap, restating the *entire* history every turn grows
-    unbounded with turn count and can overflow the model's context window on
-    a long-running query -- or even from one oversized `adjust_scale` call
-    (up to 50 chunks x ~400-word snippets is ~26k tokens by itself). Older
-    rounds are dropped first; a single round that alone exceeds the budget
-    is hard-truncated rather than dropped, so the Reasoner always sees at
-    least the most recent result. `evidence_log` itself is untouched --
-    callers that need the full history (the run's own trace) are unaffected.
+def _format_scratchpad(scratchpad_log: list[dict]) -> str:
+    """Renders the accumulated per-turn scratchpad notes for the Reasoner.
+    Each entry is already a short, LLM-condensed summary (`_run_scratchpad`)
+    rather than a turn's raw tool output, so unlike the evidence dump this
+    replaces, there's no character budget or truncation here -- even a few
+    dozen turns of notes stays tiny next to a single turn's raw JSON hits.
     """
-    if not evidence_log:
-        return "(no evidence gathered yet)"
-    if char_budget is None:
-        char_budget = config.evidence_char_budget
-
-    kept_blocks = []
-    total_chars = 0
-    dropped = 0
-    for entry in reversed(evidence_log):
-        block = f"[Turn {entry['turn']}] {entry['action']}({entry['args']}):\n{entry['output']}"
-        if len(block) > char_budget:
-            block = block[:char_budget] + "\n...[truncated -- this single result exceeded the evidence budget]"
-        if kept_blocks and total_chars + len(block) > char_budget:
-            dropped += 1
-            continue
-        kept_blocks.append(block)
-        total_chars += len(block)
-
-    kept_blocks.reverse()
-    header = (
-        f"[{dropped} earlier search round(s) omitted to stay within context -- "
-        "rely on the Global-Planner's plan for what they covered]\n\n"
-        if dropped else ""
-    )
-    return header + "\n".join(kept_blocks)
+    if not scratchpad_log:
+        return "(no searches performed yet)"
+    return "\n\n".join(f"--- Turn {e['turn']} ---\n{e['note']}" for e in scratchpad_log)
 
 
 _DEFAULT_DECISION = {
@@ -572,7 +601,7 @@ class InteractAgent:
             max_retries=config.request_max_retries,
         )
 
-    # -- the three roles, each its own call/prompt -------------------------
+    # -- the three roles (plus the scratchpad-writer), each its own call/prompt --
     #
     # Each method appends one record to `transcript`: the exact messages sent
     # and the parsed response, so `--save-transcripts` reproduces precisely
@@ -588,6 +617,8 @@ class InteractAgent:
             model=config.planner_model,
             messages=messages,
             temperature=config.temperature,
+            top_p=config.top_p,
+            top_k=config.top_k,
         )
         plan = (response.choices[0].message.content or "").strip()
         transcript.append({
@@ -597,19 +628,19 @@ class InteractAgent:
         return plan
 
     def _run_reasoner(
-        self, question: str, plan: str, evidence_log: list[dict], force_answer: bool,
+        self, question: str, plan: str, scratchpad_log: list[dict], force_answer: bool,
         turn: int, transcript: list[dict],
     ) -> dict:
         user_content = (
             f"Original question (in the source language): {question}\n\n"
             f"Global-Planner's plan:\n{plan}\n\n"
-            f"Evidence gathered so far:\n{_format_evidence(evidence_log)}\n"
+            f"Scratchpad Log:\n{_format_scratchpad(scratchpad_log)}\n"
         )
         if not self.engine.entity_graph.is_built:
             user_content += (
                 "\n(No entity relationship graph is available for this corpus -- "
-                "do not propose graph_search; use entity_match or exact_search "
-                "for entity-relationship questions instead.)\n"
+                "do not propose graph_search; use exact_search for "
+                "entity-relationship questions instead.)\n"
             )
         if force_answer:
             user_content += (
@@ -699,6 +730,45 @@ class InteractAgent:
         })
         return {"tool_calls": calls, "final_text": final_text}
 
+    def _run_scratchpad(
+        self, question: str, goal: str, tool_results: list[tuple[str, dict, str]],
+        turn: int, transcript: list[dict],
+    ) -> str:
+        """Condenses this turn's tool call(s) and their raw output into a
+        short note (see `SCRATCHPAD_SYSTEM_PROMPT`) that the Reasoner reads
+        on the next turn instead of the raw output. Not one of the paper's
+        three roles -- see the module docstring.
+        """
+        calls_text = "\n\n".join(f"{name}({args}):\n{output}" for name, args, output in tool_results)
+        user_content = (
+            f"Original question (in the source language): {question}\n\n"
+            f"This turn's goal (from the Adaptive-Reasoner's analysis):\n{goal}\n\n"
+            f"Tool call(s) and their results:\n{calls_text}"
+        )
+        messages = [
+            {"role": "system", "content": SCRATCHPAD_SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ]
+        response = self.client.chat.completions.create(
+            model=config.scratchpad_model,
+            messages=messages,
+            temperature=config.temperature,
+        )
+        note = (response.choices[0].message.content or "").strip()
+        if not note:
+            note = (
+                "Goal: (unspecified)\n"
+                "Observations: (scratchpad writer returned no usable response -- "
+                "see the raw tool output in the trace)\n"
+                "Achieved: no -- scratchpad synthesis failed\n"
+                "Next Steps: retry this sub-task or move to the next one"
+            )
+        transcript.append({
+            "role_call": "scratchpad", "turn": turn, "model": config.scratchpad_model,
+            "messages": messages, "response": note,
+        })
+        return note
+
     # -- the episode loop --------------------------------------------------
 
     def answer(self, query_id: str, query_text: str, language: str = "") -> AgentResult:
@@ -706,7 +776,7 @@ class InteractAgent:
         retrieved_docids: list[list[str]] = []
         tool_call_counts: dict[str, int] = {}
         result: list[dict] = []
-        evidence_log: list[dict] = []
+        scratchpad_log: list[dict] = []
         transcript: list[dict] = []
         final_answer = ""
         error: str | None = None
@@ -736,7 +806,7 @@ class InteractAgent:
                 # (matching the paper); the Executor below decides that every
                 # turn, regardless of which path the Reasoner narrated here.
                 decision = self._run_reasoner(
-                    query_text, plan, evidence_log, force_answer=last_turn,
+                    query_text, plan, scratchpad_log, force_answer=last_turn,
                     turn=turn + 1, transcript=transcript,
                 )
                 _debug(f"reasoner decision: {decision['decision']} - {decision['analysis'][:300]}")
@@ -781,12 +851,13 @@ class InteractAgent:
                     })
                     continue
 
+                turn_tool_results: list[tuple[str, dict, str]] = []
                 for name, args in tool_calls:
                     tool_call_counts[name] = tool_call_counts.get(name, 0) + 1
                     tool_output, docids = _dispatch(self.engine, name, args)
                     if name in RETRIEVAL_ACTIONS:
                         retrieved_docids.append(docids)
-                    evidence_log.append({"turn": turn + 1, "action": name, "args": args, "output": tool_output})
+                    turn_tool_results.append((name, args, tool_output))
                     _debug(f"executor {name}({args}) -> {tool_output[:300]}{'...' if len(tool_output) > 300 else ''}")
                     result.append({
                         "type": "tool_call",
@@ -811,6 +882,24 @@ class InteractAgent:
                         "output": final_answer,
                         "role": "executor",
                         "model": config.executor_model,
+                    })
+                else:
+                    # Condense this turn's tool output into a scratchpad note
+                    # for the Reasoner to read next turn, instead of carrying
+                    # the raw output forward (see the module docstring).
+                    note = self._run_scratchpad(
+                        query_text, decision["analysis"], turn_tool_results,
+                        turn=turn + 1, transcript=transcript,
+                    )
+                    scratchpad_log.append({"turn": turn + 1, "note": note})
+                    _debug(f"scratchpad note: {note[:300]}{'...' if len(note) > 300 else ''}")
+                    result.append({
+                        "type": "reasoning",
+                        "tool_name": None,
+                        "arguments": None,
+                        "output": note,
+                        "role": "executor",
+                        "model": config.scratchpad_model,
                     })
         except Exception as exc:  # noqa: BLE001 -- save the partial trace rather than losing it
             error = repr(exc)

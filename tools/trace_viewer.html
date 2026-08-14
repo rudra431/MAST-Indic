@@ -1118,7 +1118,7 @@
       language: "hi",
       retriever: "interact-rag/embeddinggemma-300m",
       llm: "gpt-4o-mini",
-      tool_call_counts: { semantic_search: 1, weighted_fusion: 1, entity_match: 1 },
+      tool_call_counts: { semantic_search: 1, weighted_fusion: 1, graph_search: 1 },
       retrieved_docids: [["58201"], ["44112", "58201"], ["44112"]],
       transcript: [
         { role_call: "planner", turn: 0, model: "gpt-4o-mini",
@@ -1151,10 +1151,10 @@
         { type: "reasoning", tool_name: null, arguments: null, role: "reasoner", model: "gpt-4o-mini",
           decision: { decision: "conclude", analysis: "Therefore, the college's own page confirms it moved roughly 6 miles from its founding site, within the 2-7 mile range, founded in 1956 (inside 1949-1959), by Lala Shri Ram. The research is complete and I have sufficient information to answer." },
           output: "" },
-        { type: "tool_call", tool_name: "entity_match", arguments: "{\"entity\": \"Lala Shri Ram\"}",
+        { type: "tool_call", tool_name: "graph_search", arguments: "{\"entity\": \"Lala Shri Ram\", \"hops\": 1}",
           role: "executor", model: "gpt-4o-mini",
           output: JSON.stringify([
-            { docid: "44112", url: "https://en.wikipedia.org/wiki/Lala_Shri_Ram", score: 1000.43, snippet: "Lala Shri Ram (1884-1963) founded Lady Shri Ram College in 1956. His hometown, Sonepat, is in Haryana — the state neighboring Delhi, where the college is located." },
+            { docid: "44112", url: "https://en.wikipedia.org/wiki/Lala_Shri_Ram", score: 2, snippet: "Lala Shri Ram founded Lady Shri Ram College; Lala Shri Ram born_in Sonepat" },
           ]) },
         { type: "output_text", tool_name: null, arguments: null, role: "executor", model: "gpt-4o-mini",
           output: "Explanation: Lady Shri Ram College was founded in 1956 by Lala Shri Ram and moved about 6 miles from its original Daryaganj site to Lajpat Nagar; Lala Shri Ram's hometown, Sonepat, is in Haryana, the state neighboring Delhi.\nExact Answer: Lady Shri Ram College for Women" },

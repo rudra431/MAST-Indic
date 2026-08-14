@@ -7,9 +7,8 @@ can compose turn by turn:
 - Multi-faceted retrieval: dense `semantic_search`, BM25-ranked sparse
   `exact_search`, exact `boolean_search` (AND/OR/NOT over terms, unranked),
   and `weighted_fusion` blending dense with BM25.
-- Anchored matching: `entity_match` (literal mentions in chunk text) and
-  `graph_search` (multi-hop traversal of a pre-built entity relationship
-  graph -- see `graph_builder.py`/`entity_graph.py`).
+- Anchored matching: `graph_search`, multi-hop traversal of a pre-built
+  entity relationship graph (see `graph_builder.py`/`entity_graph.py`).
 - Context shaping: `include_docs` / `exclude_docs` pin or filter specific
   documents across subsequent retrievals in the same query, and
   `adjust_scale` changes how many chunks come back.
@@ -20,18 +19,19 @@ training pipeline (synthetic trajectory generation, SFT, GRPO). See
 `mast_indic/interact_agent.py` for the zero-shot, prompted agent that drives
 these actions instead of a fine-tuned policy.
 
-`exact_search`/`boolean_search` are backed by a real in-memory inverted
-index (`_build_inverted_index`), built once per `CorpusInteractionEngine`
-instance rather than per call -- consistent with this project's existing
-"flat matrix, brute-force scan" scale (see `index.py`), but a real
-improvement over a linear per-query scan: after the one-time build, both
-become O(query terms) lookups instead of O(corpus size). Swap in a
-persisted index (Lucene/Elasticsearch/`rank_bm25` with disk caching) if you
-outgrow rebuilding it every process start.
+`exact_search`/`boolean_search` are backed by a real inverted index
+(`_build_inverted_index`): term-frequency saturation + document-length
+normalization + IDF (BM25), not a naive keyword-count -- see that method's
+docstring for why that matters. Building it is an O(corpus size)
+tokenization pass, so it's cached to `index_dir/inverted_index.pkl` and
+reloaded on the next process start rather than redone from scratch every
+run (every eval run, every agent invocation, ...); see `_load_cached_inverted_index`.
 """
 from __future__ import annotations
 
 import math
+import os
+import pickle
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -39,12 +39,15 @@ from typing import Iterable
 
 import numpy as np
 
+from .config import config
 from .entity_graph import EntityGraph
-from .index import SearchHit, SearchIndex, _normalize, embed_texts
+from .index import META_PATH_NAME, SearchHit, SearchIndex, _normalize, embed_texts
 
 # Standard Okapi BM25 parameters (Robertson & Zaragoza, 2009 defaults).
 BM25_K1 = 1.5
 BM25_B = 0.75
+
+INVERTED_INDEX_PATH_NAME = "inverted_index.pkl"
 
 
 @dataclass
@@ -58,6 +61,36 @@ class InteractionState:
 
 def _tokenize(text: str) -> list[str]:
     return re.findall(r"\w+", text.lower())
+
+
+def _load_cached_inverted_index(cache_path: str, meta_path: str, num_docs: int) -> dict | None:
+    """Returns the cached postings/doc_freq/doc_lens/avg_doc_len payload if
+    `cache_path` exists and still matches this corpus's meta.jsonl (same
+    mtime and chunk count -- cheap proxies for "meta.jsonl hasn't been
+    rebuilt since this cache was written"), or None if there's no cache, it's
+    stale, or it fails to load (corrupt/truncated from an interrupted write --
+    caught broadly since a bad cache should fall back to rebuilding, not
+    crash the whole engine).
+    """
+    if not os.path.exists(cache_path):
+        return None
+    try:
+        with open(cache_path, "rb") as f:
+            cached = pickle.load(f)
+    except Exception:
+        return None
+    if cached.get("meta_mtime") != os.path.getmtime(meta_path) or cached.get("num_docs") != num_docs:
+        return None
+    return cached
+
+
+def _save_inverted_index_cache(cache_path: str, payload: dict) -> None:
+    """Atomic write (tmp file + rename) so a crash mid-save can't leave a
+    truncated, half-written cache for the next run to trip over."""
+    tmp_path = cache_path + ".tmp"
+    with open(tmp_path, "wb") as f:
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp_path, cache_path)
 
 
 class CorpusInteractionEngine:
@@ -86,14 +119,31 @@ class CorpusInteractionEngine:
 
     def _build_inverted_index(self) -> None:
         """Tokenize every chunk once and build term -> {chunk_idx: term_freq}
-        postings plus per-term document frequency. This is the one-time
-        O(corpus size) cost that turns exact_search/boolean_search into
-        O(query terms) lookups afterward, instead of a fresh linear scan
-        over every chunk on every call.
+        postings plus per-term document frequency -- or load a cached copy
+        from disk if `index_dir/inverted_index.pkl` exists and still matches
+        this corpus's meta.jsonl. This is otherwise an O(corpus size)
+        tokenization pass; caching it means only the *first* engine
+        construction against a given index pays that cost -- every later
+        run (a second eval pass, a fresh `python -m mast_indic...` process)
+        loads the postings from disk instead of re-tokenizing every chunk.
+        Either way, exact_search/boolean_search end up as O(query terms)
+        lookups, not a fresh linear scan over every chunk on every call.
         """
+        meta_path = os.path.join(config.index_dir, META_PATH_NAME)
+        cache_path = os.path.join(config.index_dir, INVERTED_INDEX_PATH_NAME)
+        num_docs = len(self.index.meta)
+
+        cached = _load_cached_inverted_index(cache_path, meta_path, num_docs)
+        if cached is not None:
+            self._postings = cached["postings"]
+            self._doc_freq = cached["doc_freq"]
+            self._doc_lens = cached["doc_lens"]
+            self._num_docs = cached["num_docs"]
+            self._avg_doc_len = cached["avg_doc_len"]
+            return
+
         self._postings: dict[str, dict[int, int]] = defaultdict(dict)
         self._doc_freq: dict[str, int] = defaultdict(int)
-        num_docs = len(self.index.meta)
         doc_lens = np.zeros(num_docs, dtype=np.float64)
         for i, m in enumerate(self.index.meta):
             tokens = _tokenize(m["text"])
@@ -104,6 +154,15 @@ class CorpusInteractionEngine:
         self._doc_lens = doc_lens
         self._num_docs = num_docs
         self._avg_doc_len = float(doc_lens.mean()) if num_docs else 0.0
+
+        _save_inverted_index_cache(cache_path, {
+            "meta_mtime": os.path.getmtime(meta_path),
+            "num_docs": self._num_docs,
+            "postings": self._postings,
+            "doc_freq": self._doc_freq,
+            "doc_lens": self._doc_lens,
+            "avg_doc_len": self._avg_doc_len,
+        })
 
     # -- scoring ---------------------------------------------------------
 
@@ -267,19 +326,6 @@ class CorpusInteractionEngine:
         dense = self._dense_scores(query)
         sparse = self._sparse_scores(query)
         return self._rank(w_semantic * dense + w_exact * sparse)
-
-    def entity_match(self, entity: str) -> list[SearchHit]:
-        """Retrieve chunks strongly (literally) associated with a named entity."""
-        entity_lower = entity.lower().strip()
-        if not entity_lower:
-            return []
-        mention_counts = np.array(
-            [m["text"].lower().count(entity_lower) for m in self.index.meta], dtype=np.float32
-        )
-        # literal mentions dominate the ranking; embedding similarity only
-        # breaks ties among chunks that mention the entity equally often.
-        scores = mention_counts * 1000.0 + self._dense_scores(entity)
-        return self._rank(scores)
 
     def graph_search(self, entity: str, hops: int = 1) -> list[SearchHit]:
         """Traverse the entity relationship graph outward from `entity`.

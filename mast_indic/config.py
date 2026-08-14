@@ -35,7 +35,7 @@ class Config:
         "OPENAI_API_KEY", "not-needed"))
     chat_model: str = field(default_factory=lambda: os.environ.get(
         "MAST_CHAT_MODEL", "gpt-4o-mini"))
-    temperature: float = field(default_factory=lambda: _float("MAST_TEMPERATURE", 0.0))
+    temperature: float = field(default_factory=lambda: _float("MAST_TEMPERATURE", 1.0))
     # Per-request timeout to the chat LLM, and retries on transient failures
     # (connect/read timeouts, 5xx) before giving up on a single call. Keep
     # this well below your batch script's patience -- a hung/unreachable
@@ -54,15 +54,19 @@ class Config:
         "MAST_JUDGE_MODEL", os.environ.get("MAST_CHAT_MODEL", "gpt-4o-mini")))
 
     # Interact-RAG-style agent (mast_indic/interact_agent.py): one model per
-    # role (Global-Planner / Adaptive-Reasoner / Executor), each defaulting
-    # to the chat LLM above -- set MAST_*_MODEL to split roles across models
-    # (e.g. a cheap model for planning, a stronger one for the reasoner).
+    # role (Global-Planner / Adaptive-Reasoner / Executor), plus the
+    # scratchpad-writer call added on top of the paper's three roles (see
+    # that module's docstring) -- each defaulting to the chat LLM above; set
+    # MAST_*_MODEL to split roles across models (e.g. a cheap model for
+    # planning, a stronger one for the reasoner).
     planner_model: str = field(default_factory=lambda: os.environ.get(
         "MAST_PLANNER_MODEL", os.environ.get("MAST_CHAT_MODEL", "gpt-4o-mini")))
     reasoner_model: str = field(default_factory=lambda: os.environ.get(
         "MAST_REASONER_MODEL", os.environ.get("MAST_CHAT_MODEL", "gpt-4o-mini")))
     executor_model: str = field(default_factory=lambda: os.environ.get(
         "MAST_EXECUTOR_MODEL", os.environ.get("MAST_CHAT_MODEL", "gpt-4o-mini")))
+    scratchpad_model: str = field(default_factory=lambda: os.environ.get(
+        "MAST_SCRATCHPAD_MODEL", os.environ.get("MAST_CHAT_MODEL", "gpt-4o-mini")))
 
     # Entity relationship graph (mast_indic/graph_builder.py, used by
     # CorpusInteractionEngine.graph_search): LLM used to extract
@@ -98,15 +102,9 @@ class Config:
 
     # Agent loop / search tool
     max_turns: int = field(default_factory=lambda: _int("MAST_MAX_TURNS", 8))
-    top_k: int = field(default_factory=lambda: _int("MAST_TOP_K", 5))
+    top_k: int = field(default_factory=lambda: _int("MAST_TOP_K", 64))
+    top_p: float = field(default_factory=lambda: _float("MAST_TOP_P", 0.95))
     snippet_max_tokens: int = field(default_factory=lambda: _int("MAST_SNIPPET_MAX_TOKENS", 512))
-    # Hard cap (characters) on how much accumulated evidence
-    # mast_indic/interact_agent.py restates to the Adaptive-Reasoner each
-    # turn. Without this, a long-running query (many turns) or even one
-    # oversized adjust_scale call can grow the prompt past the model's
-    # context window -- older evidence rounds are dropped first once this
-    # is exceeded; the full evidence is still kept in the run's own trace.
-    evidence_char_budget: int = field(default_factory=lambda: _int("MAST_EVIDENCE_CHAR_BUDGET", 60000))
 
     # Output
     runs_dir: str = field(default_factory=lambda: os.environ.get("MAST_RUNS_DIR", "runs"))
