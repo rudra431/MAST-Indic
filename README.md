@@ -273,30 +273,37 @@ for deciding when to use which.
 Interaction actions live in `interact_engine.py`, on top of the same
 `SearchIndex`:
 
-- `semantic_search(query)` — dense embedding retrieval (what `agent.py`'s
-  `search` tool does)
-- `exact_search(keywords)` — sparse retrieval, real Okapi BM25 over an
-  inverted index (term-frequency saturation + document-length normalization
-  + IDF — see the module docstring for why that matters over a naive
-  keyword-count). Building it is an O(corpus size) tokenization pass, so
-  it's cached to `index_dir/inverted_index.pkl` and reloaded on the next
-  process start rather than redone from scratch on every run; the cache
-  self-invalidates (falls back to rebuilding) if `meta.jsonl`'s mtime or
-  chunk count no longer match what was cached, e.g. after a corpus rebuild
-- `boolean_search(and_terms, or_terms, not_terms)` — exact AND/OR/NOT set
-  retrieval over the same inverted index, with **no ranking**: every match
-  is equally valid. For when you need strict logical control rather than a
-  best-guess ranking
-- `weighted_fusion(query, w_semantic, w_exact)` — blends dense with BM25
-  for one query
-- `graph_search(entity, hops)` — multi-hop traversal of a pre-built entity
-  relationship graph (see below), from a named entity outward; the go-to
-  action once you have a specific entity name, since (unlike every other
-  action here) it can resolve a chain of relations in one call. Returns
-  nothing until you build a graph
+- `semantic_search(query, top_k=None)` — dense embedding retrieval (what
+  `agent.py`'s `search` tool does)
+- `exact_search(keywords, top_k=None)` — sparse retrieval, real Okapi BM25
+  over an inverted index (term-frequency saturation + document-length
+  normalization + IDF — see the module docstring for why that matters over
+  a naive keyword-count). Building it is an O(corpus size) tokenization
+  pass, so it's cached to `index_dir/inverted_index.pkl` and reloaded on the
+  next process start rather than redone from scratch on every run; the
+  cache self-invalidates (falls back to rebuilding) if `meta.jsonl`'s mtime
+  or chunk count no longer match what was cached, e.g. after a corpus
+  rebuild
+- `boolean_search(and_terms, or_terms, not_terms, top_k=None)` — exact
+  AND/OR/NOT set retrieval over the same inverted index, with **no
+  ranking**: every match is equally valid. For when you need strict logical
+  control rather than a best-guess ranking
+- `weighted_fusion(query, w_semantic, w_exact, top_k=None)` — blends dense
+  with BM25 for one query
+- `graph_search(entity, hops, top_k=None)` — multi-hop traversal of a
+  pre-built entity relationship graph (see below), from a named entity
+  outward; the go-to action once you have a specific entity name, since
+  (unlike every other action here) it can resolve a chain of relations in
+  one call. Returns nothing until you build a graph
 - `include_docs(doc_ids)` / `exclude_docs(doc_ids)` — pin or filter specific
   documents across the rest of that query's retrievals
-- `adjust_scale(n)` — changes how many chunks come back per retrieval
+- `adjust_scale(n)` — changes the *default* number of chunks that come back
+  on every later retrieval that doesn't pass its own `top_k`
+
+Every retrieval action above takes an optional `top_k` that overrides
+`adjust_scale`'s current value for just that one call (clamped to 1-50,
+same as `adjust_scale` itself), without changing the default for any other
+call.
 
 Unlike `agent.py` (one system prompt, one model, one growing conversation),
 `interact_agent.py` reproduces the paper's three-module workflow as three

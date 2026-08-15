@@ -286,6 +286,7 @@ INTERACT_TOOLS = [
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "An English natural-language search query."},
+                    "top_k": {"type": "integer", "description": "Optional: how many chunks to return from just this call (1-50), overriding the current adjust_scale value. Omit to use the current scale."},
                 },
                 "required": ["query"],
             },
@@ -309,6 +310,7 @@ INTERACT_TOOLS = [
                 "type": "object",
                 "properties": {
                     "keywords": {"type": "string", "description": "Space-separated keywords or a phrase to match literally."},
+                    "top_k": {"type": "integer", "description": "Optional: how many chunks to return from just this call (1-50), overriding the current adjust_scale value. Omit to use the current scale."},
                 },
                 "required": ["keywords"],
             },
@@ -333,6 +335,7 @@ INTERACT_TOOLS = [
                     "and_terms": {"type": "array", "items": {"type": "string"}, "description": "Chunk must contain ALL of these terms."},
                     "or_terms": {"type": "array", "items": {"type": "string"}, "description": "Chunk must contain AT LEAST ONE of these terms."},
                     "not_terms": {"type": "array", "items": {"type": "string"}, "description": "Chunk must contain NONE of these terms."},
+                    "top_k": {"type": "integer", "description": "Optional: how many chunks to return from just this call (1-50), overriding the current adjust_scale value. Omit to use the current scale."},
                 },
                 "required": [],
             },
@@ -354,6 +357,7 @@ INTERACT_TOOLS = [
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "An English natural-language search query."},
+                    "top_k": {"type": "integer", "description": "Optional: how many chunks to return from just this call (1-50), overriding the current adjust_scale value. Omit to use the current scale."},
                     "w_semantic": {"type": "number", "description": "Weight for dense/embedding similarity, e.g. 0.7."},
                     "w_exact": {"type": "number", "description": "Weight for sparse/keyword overlap, e.g. 0.3."},
                 },
@@ -381,6 +385,7 @@ INTERACT_TOOLS = [
                 "properties": {
                     "entity": {"type": "string", "description": "The entity name to start from, in English."},
                     "hops": {"type": "integer", "description": "How many relationship hops to traverse outward (1-3), default 1."},
+                    "top_k": {"type": "integer", "description": "Optional: how many documents to return from just this call (1-50), overriding the current adjust_scale value. Omit to use the current scale."},
                 },
                 "required": ["entity"],
             },
@@ -429,10 +434,12 @@ INTERACT_TOOLS = [
         "function": {
             "name": "adjust_scale",
             "description": (
-                "Changes how many chunks come back per later retrieval. Increase "
-                "while still exploring broadly; decrease once you've narrowed in, to "
-                "cut noise. Not a search action itself -- it only shapes result size "
-                "for later calls."
+                "Changes the default number of chunks that come back on every later "
+                "retrieval that doesn't specify its own top_k. Increase while still "
+                "exploring broadly; decrease once you've narrowed in, to cut noise. "
+                "Not a search action itself -- it only shapes result size for later "
+                "calls. Any search action's own `top_k` argument overrides this for "
+                "just that one call, without changing the default for the rest."
             ),
             "parameters": {
                 "type": "object",
@@ -489,19 +496,21 @@ def _overcompound_query_error(query: str) -> str | None:
 
 def _dispatch(engine: CorpusInteractionEngine, name: str, args: dict) -> tuple[str, list[str]]:
     """Run one action against the engine; returns (tool_output_text, docids)."""
+    top_k = int(args["top_k"]) if args.get("top_k") is not None else None
     if name == "semantic_search":
         query = args.get("query", "")
         error = _overcompound_query_error(query)
         if error:
             return json.dumps({"error": error}), []
-        hits = engine.semantic_search(query)
+        hits = engine.semantic_search(query, top_k)
     elif name == "exact_search":
-        hits = engine.exact_search(args.get("keywords", ""))
+        hits = engine.exact_search(args.get("keywords", ""), top_k)
     elif name == "boolean_search":
         hits = engine.boolean_search(
             and_terms=args.get("and_terms") or [],
             or_terms=args.get("or_terms") or [],
             not_terms=args.get("not_terms") or [],
+            top_k=top_k,
         )
     elif name == "weighted_fusion":
         query = args.get("query", "")
@@ -512,9 +521,10 @@ def _dispatch(engine: CorpusInteractionEngine, name: str, args: dict) -> tuple[s
             query,
             float(args.get("w_semantic", 0.5)),
             float(args.get("w_exact", 0.5)),
+            top_k,
         )
     elif name == "graph_search":
-        hits = engine.graph_search(args.get("entity", ""), int(args.get("hops", 1) or 1))
+        hits = engine.graph_search(args.get("entity", ""), int(args.get("hops", 1) or 1), top_k)
     elif name == "include_docs":
         return engine.include_docs(args.get("doc_ids", []) or []), []
     elif name == "exclude_docs":

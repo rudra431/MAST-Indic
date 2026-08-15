@@ -651,6 +651,56 @@
     padding: 1px 5px;
     font-size: 10px;
   }
+
+  /* ---------------- Reveal animations: each turn/card animates in as you
+     scroll it into view (IntersectionObserver toggles .in-view -- see the
+     script), rather than all at once on load, so scrolling down through a
+     trace visibly walks through it turn by turn, step by step. ---------- */
+  @media (prefers-reduced-motion: no-preference) {
+    @keyframes badgePop {
+      from { opacity: 0; transform: scale(0.55); }
+      to   { opacity: 1; transform: scale(1); }
+    }
+    @keyframes lineGrow {
+      from { transform: scaleY(0); }
+      to   { transform: scaleY(1); }
+    }
+    .timeline::before {
+      animation: lineGrow 0.7s ease-out both;
+      transform-origin: top;
+    }
+    .turn, .verdict {
+      opacity: 0;
+      transform: translateY(28px);
+      transition: opacity 0.55s cubic-bezier(0.16, 1, 0.3, 1),
+                  transform 0.55s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+    .turn.in-view, .verdict.in-view {
+      opacity: 1;
+      transform: translateY(0);
+    }
+    .turn.in-view .turn-badge, .verdict.in-view .verdict-badge {
+      animation: badgePop 0.4s cubic-bezier(0.34, 1.56, 0.64, 1) both;
+    }
+    /* Cards/hits are hidden until their turn is in view, then cascade in
+       via each element's own transition-delay (set inline in JS) so the
+       turn's contents ripple in shortly after the turn itself appears. */
+    .turn .card, .verdict .card, .turn .hit-card {
+      opacity: 0;
+      transform: translateY(14px);
+      transition: opacity 0.4s cubic-bezier(0.16, 1, 0.3, 1),
+                  transform 0.4s cubic-bezier(0.16, 1, 0.3, 1),
+                  box-shadow 0.15s;
+    }
+    .turn.in-view .card, .verdict.in-view .card, .turn.in-view .hit-card {
+      opacity: 1;
+      transform: translateY(0);
+    }
+    .turn.in-view .card:hover, .verdict.in-view .card:hover {
+      box-shadow: var(--shadow-2);
+      transform: translateY(-1px);
+    }
+  }
 </style>
 
 <div class="app">
@@ -704,6 +754,28 @@
   var dropzone = document.getElementById("dropzone");
   var fileInput = document.getElementById("fileInput");
   var demoBtn = document.getElementById("demoBtn");
+
+  // ---- scroll-triggered reveal --------------------------------------------
+  // Adds .in-view (see the CSS) the first time an element scrolls into the
+  // viewport, then stops watching it -- so turns/verdicts animate in as you
+  // scroll down through a trace instead of all at once when it's loaded.
+  // Falls back to revealing immediately if IntersectionObserver isn't
+  // available at all.
+  var revealObserver = (typeof IntersectionObserver !== "undefined")
+    ? new IntersectionObserver(function (entries) {
+        entries.forEach(function (entry) {
+          if (entry.isIntersecting) {
+            entry.target.classList.add("in-view");
+            revealObserver.unobserve(entry.target);
+          }
+        });
+      }, { threshold: 0.12, rootMargin: "0px 0px -8% 0px" })
+    : null;
+
+  function observeReveal(elm) {
+    if (revealObserver) revealObserver.observe(elm);
+    else elm.classList.add("in-view");
+  }
 
   // ---- parsing -----------------------------------------------------------
 
@@ -872,7 +944,7 @@
     return '<span class="role-dot role-' + role + '-dot"></span>';
   }
 
-  function renderHits(outputRaw) {
+  function renderHits(outputRaw, baseDelayMs) {
     var parsed = tryParseJson(outputRaw);
     if (!Array.isArray(parsed)) {
       return '<div class="note-text">' + escapeHtml(outputRaw) + "</div>";
@@ -884,10 +956,13 @@
     parsed.forEach(function (h) { if (typeof h.score === "number") maxScore = Math.max(maxScore, h.score); });
     maxScore = maxScore || 1;
     var html = '<div class="hits-scroll">';
-    parsed.forEach(function (h) {
+    parsed.forEach(function (h, idx) {
       var pct = Math.max(4, Math.min(100, Math.round(((h.score || 0) / maxScore) * 100)));
+      // Ripples in just after its own tool-call card (baseDelayMs), rather
+      // than racing that card's own reveal the moment the turn comes into view.
+      var hitDelay = (baseDelayMs || 0) + 60 + Math.min(idx * 45, 360);
       html +=
-        '<div class="hit-card">' +
+        '<div class="hit-card" style="transition-delay:' + hitDelay + 'ms">' +
           '<div class="hit-top"><span class="hit-docid">#' + escapeHtml(h.docid) + '</span>' +
           '<span class="hit-score">' + (typeof h.score === "number" ? h.score.toFixed(4) : "—") + '</span></div>' +
           '<div class="hit-meter"><span style="width:' + pct + '%"></span></div>' +
@@ -928,7 +1003,7 @@
     return card;
   }
 
-  function renderExecutorStep(entry) {
+  function renderExecutorStep(entry, baseDelayMs) {
     var card = el("div", "card");
     if (entry.type === "tool_call") {
       var args = tryParseJson(entry.arguments);
@@ -942,7 +1017,7 @@
         '<div class="card-body">' +
           '<div class="toolcall-sig"><span class="fn">' + escapeHtml(entry.tool_name) + '(</span>' +
           '<span class="args">' + escapeHtml(argStr) + '</span><span class="fn">)</span></div>' +
-          renderHits(entry.output) +
+          renderHits(entry.output, baseDelayMs) +
         '</div>';
     } else {
       card.innerHTML =
@@ -1007,14 +1082,31 @@
     main.appendChild(top);
 
     // -- scrolling timeline --
+    // Each .turn/.verdict block starts hidden and gets an .in-view class
+    // (see the CSS) once revealObserver sees it enter the viewport, so
+    // scrolling down through a trace visibly reveals it turn by turn
+    // rather than everything fading in at once on load. Within a turn,
+    // each card gets a small transition-delay of its own (reset per turn)
+    // so its cards ripple in shortly after the turn itself appears.
     var scroll = el("div", "timeline-scroll");
     var timeline = el("div", "timeline");
+    var CARD_STEP_MS = 70;
+    var CARD_STEP_MAX_MS = 260;
+    function cardStagger(counterRef) {
+      var d = Math.min(counterRef.ms, CARD_STEP_MAX_MS);
+      counterRef.ms += CARD_STEP_MS;
+      return d;
+    }
 
     if (grouped.planner) {
       var t0 = el("div", "turn");
       t0.innerHTML = '<div class="turn-badge">◆</div><div class="turn-label">Turn 0 · Planning</div>';
-      t0.appendChild(renderPlannerCard(grouped.planner));
+      var counter0 = { ms: 0 };
+      var plannerCard = renderPlannerCard(grouped.planner);
+      plannerCard.style.transitionDelay = cardStagger(counter0) + "ms";
+      t0.appendChild(plannerCard);
       timeline.appendChild(t0);
+      observeReveal(t0);
     }
 
     grouped.turns.forEach(function (turn, i) {
@@ -1022,9 +1114,20 @@
       var badge = el("div", "turn-badge", String(i + 1));
       tEl.appendChild(badge);
       tEl.appendChild(el("div", "turn-label", "Turn " + (i + 1)));
-      if (turn.reasoner) tEl.appendChild(renderReasonerCard(turn.reasoner));
-      turn.steps.forEach(function (step) { tEl.appendChild(renderExecutorStep(step)); });
+      var counter = { ms: 0 };
+      if (turn.reasoner) {
+        var rCard = renderReasonerCard(turn.reasoner);
+        rCard.style.transitionDelay = cardStagger(counter) + "ms";
+        tEl.appendChild(rCard);
+      }
+      turn.steps.forEach(function (step) {
+        var stepDelayMs = cardStagger(counter);
+        var stepCard = renderExecutorStep(step, stepDelayMs);
+        stepCard.style.transitionDelay = stepDelayMs + "ms";
+        tEl.appendChild(stepCard);
+      });
       timeline.appendChild(tEl);
+      observeReveal(tEl);
     });
 
     if (grouped.verdict) {
@@ -1041,6 +1144,7 @@
         '</div>';
       vEl.appendChild(vCard);
       timeline.appendChild(vEl);
+      observeReveal(vEl);
     } else if (record.error) {
       var eEl = el("div", "verdict");
       eEl.innerHTML = '<div class="verdict-badge" style="background:var(--state-reflect-soft);border-color:var(--state-reflect);color:var(--state-reflect)">✕</div>';
@@ -1049,6 +1153,7 @@
         '<div class="card-head"><span class="role-name">Run failed</span></div>' +
         '<div class="card-body"><div class="note-text">' + escapeHtml(record.error) + '</div></div>';
       eEl.appendChild(eCard);
+      observeReveal(eEl);
       timeline.appendChild(eEl);
     }
 
