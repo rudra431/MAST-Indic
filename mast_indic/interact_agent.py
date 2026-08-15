@@ -77,10 +77,9 @@ def _debug(msg: str) -> None:
         print(f"[debug] {msg}", file=sys.stderr, flush=True)
 
 
-PLANNER_SYSTEM_PROMPT = """You are the Global-Planner in an Interact-RAG-style \
-research pipeline (MAST @ FIRE 2026, Track 2: Indic), an expert research assistant \
+PLANNER_SYSTEM_PROMPT = """You are an expert research assistant \
 focused on high-level planning. You will be given a complex question written in an \
-Indian language; the evidence corpus and the eventual answer are in English. An \
+Indian language; the evidence corpus and the eventual answers are in English. An \
 Adaptive-Reasoner and Executor downstream will carry out your plan by searching the \
 corpus -- your job is only to plan, not to search or answer.
 
@@ -107,8 +106,7 @@ Primary Plan: 1. Determine the director of the film "Polish-Russian War". 2. Ide
 the birthplace of that director. 3. Formulate the final answer.
 """
 
-REASONER_SYSTEM_PROMPT = """You are an expert research strategist for the MAST @ \
-FIRE 2026 benchmark (Track 2: Indic), the Adaptive-Reasoner in an Interact-RAG-style \
+REASONER_SYSTEM_PROMPT = """You are an expert research strategist in an Interact-RAG-style \
 research pipeline. Your task is to analyze the state of a research query, evaluate \
 the latest search results, and devise the next best step. You should only generate \
 the plan for the next action, not execute it yourself -- an Executor downstream will \
@@ -155,9 +153,7 @@ inaccurate -- only reason about the evidence log below.
   concise but clear.
 """
 
-EXECUTOR_SYSTEM_PROMPT = """You are a specialized searching execution agent, the \
-Executor in an Interact-RAG-style research pipeline (MAST @ FIRE 2026, Track 2: \
-Indic). You will be presented with the user's original question (possibly written in \
+EXECUTOR_SYSTEM_PROMPT = """You are a specialized searching execution agent. You will be presented with the user's original question (possibly written in \
 an Indian language; the evidence corpus and your final answer are in English), prior \
 search results, and the Adaptive-Reasoner's analysis of them. Your sole purpose is to \
 perform one of two specific actions each turn -- either call tool(s) or provide the \
@@ -499,9 +495,9 @@ def _dispatch(engine: CorpusInteractionEngine, name: str, args: dict) -> tuple[s
     top_k = int(args["top_k"]) if args.get("top_k") is not None else None
     if name == "semantic_search":
         query = args.get("query", "")
-        error = _overcompound_query_error(query)
-        if error:
-            return json.dumps({"error": error}), []
+        # error = _overcompound_query_error(query)
+        # if error:
+        #     return json.dumps({"error": error}), []
         hits = engine.semantic_search(query, top_k)
     elif name == "exact_search":
         hits = engine.exact_search(args.get("keywords", ""), top_k)
@@ -628,7 +624,9 @@ class InteractAgent:
             messages=messages,
             temperature=config.temperature,
             top_p=config.top_p,
-            top_k=config.top_k,
+            extra_body={
+                "top_k": config.top_k,
+            },
         )
         plan = (response.choices[0].message.content or "").strip()
         transcript.append({

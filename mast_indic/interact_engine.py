@@ -173,7 +173,9 @@ class CorpusInteractionEngine:
     # -- scoring ---------------------------------------------------------
 
     def _dense_scores(self, query: str) -> np.ndarray:
-        qvec = _normalize(embed_texts([query]))[0]
+        task = f'Given a web search query, retrieve relevant passages that answer the query\nQuery: {query}'
+        
+        qvec = _normalize(embed_texts([task]))[0]
         return self.index.matrix @ qvec  # cosine sim, both sides normalized
 
     def _bm25_raw(self, keywords: str, k1: float = BM25_K1, b: float = BM25_B) -> np.ndarray:
