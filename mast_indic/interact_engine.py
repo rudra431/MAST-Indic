@@ -10,8 +10,9 @@ can compose turn by turn:
 - Anchored matching: `graph_search`, multi-hop traversal of a pre-built
   entity relationship graph (see `graph_builder.py`/`entity_graph.py`).
 - Context shaping: `include_docs` / `exclude_docs` pin or filter specific
-  documents across subsequent retrievals in the same query, and
-  `adjust_scale` changes how many chunks come back.
+  documents across subsequent retrievals in the same query. Every retrieval
+  action also takes its own `top_k` to control how many chunks come back
+  for that one call, falling back to a fixed default if omitted.
 
 This module re-implements only that *interaction interface* on top of the
 existing flat-numpy `SearchIndex` -- it does not reproduce the paper's
@@ -56,6 +57,10 @@ class InteractionState:
 
     included_docids: set[str] = field(default_factory=set)
     excluded_docids: set[str] = field(default_factory=set)
+    # Default result count for a retrieval action when it isn't given its own
+    # top_k. Not adjustable via any tool -- InteractAgent leaves it at this
+    # default for the whole run; other engine consumers (e.g. exact_agent.py)
+    # can still set it directly to match their own config.
     scale: int = 5
 
 
@@ -64,8 +69,7 @@ def _tokenize(text: str) -> list[str]:
 
 
 def _clamp_scale(n: int) -> int:
-    """Shared bound for both the persistent `adjust_scale` state and any
-    per-call `top_k` override -- same [1, 50] range either way."""
+    """Shared [1, 50] bound for any per-call `top_k` override."""
     return max(1, min(int(n), 50))
 
 
@@ -254,14 +258,14 @@ class CorpusInteractionEngine:
 
     def _rank_exact(self, matched: set[int], top_k: int | None = None) -> list[SearchHit]:
         """Like `_rank`, but for boolean/exact matches: returns *only* the
-        chunks in `matched` (deduped per document, capped at `adjust_scale`
-        or the per-call `top_k` override) -- never padded with non-matching
-        filler the way `_rank`'s score-everything-then-take-top-K does,
-        since "no match" has to mean zero results here, not the corpus's
-        least-bad guess. Pinned docs from `include_docs` are intentionally
-        NOT force-included -- forcing in a document that doesn't actually
-        satisfy the boolean expression would contradict what this action is
-        for.
+        chunks in `matched` (deduped per document, capped at the default
+        result count or the per-call `top_k` override) -- never padded with
+        non-matching filler the way `_rank`'s score-everything-then-take-top-K
+        does, since "no match" has to mean zero results here, not the
+        corpus's least-bad guess. Pinned docs from `include_docs` are
+        intentionally NOT force-included -- forcing in a document that
+        doesn't actually satisfy the boolean expression would contradict
+        what this action is for.
         """
         limit = self.state.scale if top_k is None else _clamp_scale(top_k)
         best_per_doc: dict[str, int] = {}
@@ -282,12 +286,12 @@ class CorpusInteractionEngine:
 
     def semantic_search(self, query: str, top_k: int | None = None) -> list[SearchHit]:
         """Dense retrieval: embedding similarity to the query. `top_k`
-        overrides `adjust_scale`'s current value for this call only."""
+        overrides the default result count for this call only."""
         return self._rank(self._dense_scores(query), top_k)
 
     def exact_search(self, keywords: str, top_k: int | None = None) -> list[SearchHit]:
         """Sparse retrieval: BM25 ranking over the inverted index. `top_k`
-        overrides `adjust_scale`'s current value for this call only."""
+        overrides the default result count for this call only."""
         return self._rank(self._sparse_scores(keywords), top_k)
 
     def boolean_search(
@@ -338,7 +342,7 @@ class CorpusInteractionEngine:
         self, query: str, w_semantic: float, w_exact: float, top_k: int | None = None,
     ) -> list[SearchHit]:
         """Blend dense and sparse scores for `query` with the given weights.
-        `top_k` overrides `adjust_scale`'s current value for this call only."""
+        `top_k` overrides the default result count for this call only."""
         dense = self._dense_scores(query)
         sparse = self._sparse_scores(query)
         return self._rank(w_semantic * dense + w_exact * sparse, top_k)
@@ -348,9 +352,9 @@ class CorpusInteractionEngine:
 
         Returns nothing if `index_store/entity_graph.jsonl` doesn't exist for
         this corpus (see `entity_graph.py`). Results are deduped per source
-        document (richest-in-relations document first, up to
-        `adjust_scale`'s current limit, or `top_k` if given for this call);
-        the snippet is the extracted relation(s) themselves rather than raw
+        document (richest-in-relations document first, up to the default
+        result count, or `top_k` if given for this call); the snippet is
+        the extracted relation(s) themselves rather than raw
         chunk text, so the Executor sees *why* a document matched, not just
         that it did. A relation whose tail is a concept (not a literal
         entity) is marked `[concept]` so the Executor doesn't mistake it for
@@ -394,8 +398,3 @@ class CorpusInteractionEngine:
         self.state.excluded_docids.update(doc_ids)
         self.state.included_docids.difference_update(doc_ids)
         return f"Excluded {len(doc_ids)} doc(s) from subsequent retrievals: {doc_ids}"
-
-    def adjust_scale(self, n: int) -> str:
-        n = _clamp_scale(n)
-        self.state.scale = n
-        return f"Result scale set to {n} chunk(s) per subsequent retrieval."

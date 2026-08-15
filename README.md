@@ -297,13 +297,12 @@ Interaction actions live in `interact_engine.py`, on top of the same
   one call. Returns nothing until you build a graph
 - `include_docs(doc_ids)` / `exclude_docs(doc_ids)` — pin or filter specific
   documents across the rest of that query's retrievals
-- `adjust_scale(n)` — changes the *default* number of chunks that come back
-  on every later retrieval that doesn't pass its own `top_k`
 
-Every retrieval action above takes an optional `top_k` that overrides
-`adjust_scale`'s current value for just that one call (clamped to 1-50,
-same as `adjust_scale` itself), without changing the default for any other
-call.
+Every retrieval action above takes an optional `top_k` (clamped to 1-50) to
+request more or fewer results for just that one call; if omitted, it falls
+back to a fixed default (`InteractionState.scale` in `interact_engine.py`,
+5 chunks). There's no separate action to change that default from within a
+run -- each call either states its own `top_k` or gets the default.
 
 Unlike `agent.py` (one system prompt, one model, one growing conversation),
 `interact_agent.py` reproduces the paper's three-module workflow as three
@@ -382,9 +381,9 @@ own call) condenses each turn's tool call(s) and their output into a short
 `Goal:`/`Observations:`/`Achieved:`/`Next Steps:` note. That note -- not the
 raw output -- is what the Reasoner reads on subsequent turns. Restating raw
 history unbounded would grow with turn count and can overflow the model's
-context window on a long-running query -- or even from a single oversized
-`adjust_scale` call (up to 50 chunks x ~400-word snippets is ~26k tokens by
-itself); condensed notes stay small regardless of turn count, so there's no
+context window on a long-running query -- or even from a single retrieval
+call with a large `top_k` (up to 50 chunks x ~400-word snippets is ~26k
+tokens by itself); condensed notes stay small regardless of turn count, so there's no
 character budget or truncation/dropping to reason about. This only changes
 what's sent to the LLM -- the full raw tool output still ends up in the
 run's own `result`/`transcript` trace, alongside the note itself (tagged

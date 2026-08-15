@@ -202,8 +202,6 @@ when taking action 1 above):
   relevant).
 - exclude_docs(doc_ids): filter out document IDs you've confirmed are \
   irrelevant or noisy, so later retrievals stop surfacing them.
-- adjust_scale(n): change how many chunks come back per retrieval (smaller \
-  once you've narrowed in for precision, larger while still exploring).
 
 When writing the actual query/keywords/entity argument, respect what each \
 action is good at -- do not just restate the Reasoner's full analysis \
@@ -282,7 +280,7 @@ INTERACT_TOOLS = [
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "An English natural-language search query."},
-                    "top_k": {"type": "integer", "description": "Optional: how many chunks to return from just this call (1-50), overriding the current adjust_scale value. Omit to use the current scale."},
+                    "top_k": {"type": "integer", "description": "how many chunks to return from just this call (1-50)"},
                 },
                 "required": ["query"],
             },
@@ -306,7 +304,7 @@ INTERACT_TOOLS = [
                 "type": "object",
                 "properties": {
                     "keywords": {"type": "string", "description": "Space-separated keywords or a phrase to match literally."},
-                    "top_k": {"type": "integer", "description": "Optional: how many chunks to return from just this call (1-50), overriding the current adjust_scale value. Omit to use the current scale."},
+                    "top_k": {"type": "integer", "description": "Optional: how many chunks to return from just this call (1-50)."},
                 },
                 "required": ["keywords"],
             },
@@ -331,7 +329,7 @@ INTERACT_TOOLS = [
                     "and_terms": {"type": "array", "items": {"type": "string"}, "description": "Chunk must contain ALL of these terms."},
                     "or_terms": {"type": "array", "items": {"type": "string"}, "description": "Chunk must contain AT LEAST ONE of these terms."},
                     "not_terms": {"type": "array", "items": {"type": "string"}, "description": "Chunk must contain NONE of these terms."},
-                    "top_k": {"type": "integer", "description": "Optional: how many chunks to return from just this call (1-50), overriding the current adjust_scale value. Omit to use the current scale."},
+                    "top_k": {"type": "integer", "description": "Optional: how many chunks to return from just this call (1-50)."},
                 },
                 "required": [],
             },
@@ -353,7 +351,7 @@ INTERACT_TOOLS = [
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "An English natural-language search query."},
-                    "top_k": {"type": "integer", "description": "Optional: how many chunks to return from just this call (1-50), overriding the current adjust_scale value. Omit to use the current scale."},
+                    "top_k": {"type": "integer", "description": "Optional: how many chunks to return from just this call (1-50)."},
                     "w_semantic": {"type": "number", "description": "Weight for dense/embedding similarity, e.g. 0.7."},
                     "w_exact": {"type": "number", "description": "Weight for sparse/keyword overlap, e.g. 0.3."},
                 },
@@ -381,7 +379,7 @@ INTERACT_TOOLS = [
                 "properties": {
                     "entity": {"type": "string", "description": "The entity name to start from, in English."},
                     "hops": {"type": "integer", "description": "How many relationship hops to traverse outward (1-3), default 1."},
-                    "top_k": {"type": "integer", "description": "Optional: how many documents to return from just this call (1-50), overriding the current adjust_scale value. Omit to use the current scale."},
+                    "top_k": {"type": "integer", "description": "Optional: how many documents to return from just this call (1-50)."},
                 },
                 "required": ["entity"],
             },
@@ -394,7 +392,7 @@ INTERACT_TOOLS = [
             "description": (
                 "Pins specific document IDs so they're guaranteed to appear in later "
                 "retrievals. Use to lock in a document you've already confirmed is "
-                "relevant, so scale limits or reranking in later calls can't drop it. "
+                "relevant, so a later call's top_k limit or reranking can't drop it. "
                 "Not a search action itself -- it only shapes what later searches surface."
             ),
             "parameters": {
@@ -424,32 +422,11 @@ INTERACT_TOOLS = [
                 "required": ["doc_ids"],
             },
         },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "adjust_scale",
-            "description": (
-                "Changes the default number of chunks that come back on every later "
-                "retrieval that doesn't specify its own top_k. Increase while still "
-                "exploring broadly; decrease once you've narrowed in, to cut noise. "
-                "Not a search action itself -- it only shapes result size for later "
-                "calls. Any search action's own `top_k` argument overrides this for "
-                "just that one call, without changing the default for the rest."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "n": {"type": "integer", "description": "Number of chunks to return per retrieval, e.g. 3 or 10."},
-                },
-                "required": ["n"],
-            },
-        },
-    },
+    }
 ]
 
 # Actions that retrieve evidence (tracked in retrieved_docids); the rest
-# (include_docs/exclude_docs/adjust_scale) only mutate interaction state.
+# (include_docs/exclude_docs) only mutate interaction state.
 RETRIEVAL_ACTIONS = {
     "semantic_search", "exact_search", "boolean_search", "weighted_fusion", "graph_search",
 }
@@ -525,8 +502,6 @@ def _dispatch(engine: CorpusInteractionEngine, name: str, args: dict) -> tuple[s
         return engine.include_docs(args.get("doc_ids", []) or []), []
     elif name == "exclude_docs":
         return engine.exclude_docs(args.get("doc_ids", []) or []), []
-    elif name == "adjust_scale":
-        return engine.adjust_scale(args.get("n", 5)), []
     else:
         return json.dumps({"error": f"unknown action '{name}'"}), []
 
@@ -697,7 +672,7 @@ class InteractAgent:
         """
         user_content = (
             f"Original question (in the source language): {question}\n\n"
-            f"Adaptive-Reasoner's analysis of prior search results:\n{analysis}"
+            f"Adaptive-Reasoner's analysis of prior search results:\n{analysis}\n\n"
         )
         if not self.engine.entity_graph.is_built:
             user_content += (
