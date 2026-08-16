@@ -61,6 +61,7 @@ ignores it.
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 
@@ -203,6 +204,11 @@ when taking action 1 above):
 - exclude_docs(doc_ids): filter out document IDs you've confirmed are \
   irrelevant or noisy, so later retrievals stop surfacing them.
 
+semantic_search and boolean_search REQUIRE a top_k argument (1-50) -- always \
+decide and state how many results you want from those two, don't omit it. \
+exact_search, weighted_fusion, and graph_search accept top_k too but it's \
+optional there, falling back to a fixed default if you leave it out.
+
 When writing the actual query/keywords/entity argument, respect what each \
 action is good at -- do not just restate the Reasoner's full analysis \
 verbatim:
@@ -280,9 +286,9 @@ INTERACT_TOOLS = [
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "An English natural-language search query."},
-                    "top_k": {"type": "integer", "description": "how many chunks to return from just this call (1-50)"},
+                    "top_k": {"type": "integer", "description": "Required: how many chunks to return from just this call (1-50)."},
                 },
-                "required": ["query"],
+                "required": ["query", "top_k"],
             },
         },
     },
@@ -329,9 +335,9 @@ INTERACT_TOOLS = [
                     "and_terms": {"type": "array", "items": {"type": "string"}, "description": "Chunk must contain ALL of these terms."},
                     "or_terms": {"type": "array", "items": {"type": "string"}, "description": "Chunk must contain AT LEAST ONE of these terms."},
                     "not_terms": {"type": "array", "items": {"type": "string"}, "description": "Chunk must contain NONE of these terms."},
-                    "top_k": {"type": "integer", "description": "Optional: how many chunks to return from just this call (1-50)."},
+                    "top_k": {"type": "integer", "description": "Required: how many chunks to return from just this call (1-50)."},
                 },
-                "required": [],
+                "required": ["top_k"],
             },
         },
     },
@@ -571,6 +577,22 @@ def _ensure_final_answer_format(text: str) -> str:
     return f"Explanation: {explanation}\nExact Answer: Not found in evidence"
 
 
+def _write_checkpoint(checkpoint_path: str, **record: object) -> None:
+    """Overwrites `checkpoint_path` with `record` (same shape as the final
+    line `interact_runner.py` writes, scratchpad notes included since
+    they're already part of `result`) -- called after every turn in
+    `answer()` so a hard crash/kill mid-query (not just the exceptions
+    `answer()` itself already catches) still leaves the latest completed
+    turn's trajectory on disk instead of losing it outright. Write-then-
+    rename so a kill mid-write can't leave a truncated, half-written
+    checkpoint for the next read.
+    """
+    tmp_path = checkpoint_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(record, f, ensure_ascii=False)
+    os.replace(tmp_path, checkpoint_path)
+
+
 class InteractAgent:
     def __init__(self, search_index: SearchIndex | None = None) -> None:
         self.index = search_index or SearchIndex()
@@ -754,7 +776,15 @@ class InteractAgent:
 
     # -- the episode loop --------------------------------------------------
 
-    def answer(self, query_id: str, query_text: str, language: str = "") -> AgentResult:
+    def answer(
+        self, query_id: str, query_text: str, language: str = "",
+        checkpoint_path: str | None = None,
+    ) -> AgentResult:
+        """`checkpoint_path`, if given, is overwritten with the trajectory
+        so far (see `_write_checkpoint`) after every turn -- so a hard
+        crash/kill mid-query still leaves the latest completed turn's
+        scratchpad and trajectory on disk, not just the exceptions this
+        method already catches internally."""
         self.engine.reset()
         retrieved_docids: list[list[str]] = []
         tool_call_counts: dict[str, int] = {}
@@ -763,6 +793,14 @@ class InteractAgent:
         transcript: list[dict] = []
         final_answer = ""
         error: str | None = None
+
+        def checkpoint() -> None:
+            if checkpoint_path:
+                _write_checkpoint(
+                    checkpoint_path, query_id=query_id, language=language,
+                    tool_call_counts=tool_call_counts, retrieved_docids=retrieved_docids,
+                    result=result,
+                )
 
         _debug(f"=== query {query_id} [{language}]: {query_text!r}")
 
@@ -780,6 +818,7 @@ class InteractAgent:
                 "type": "reasoning", "tool_name": None, "arguments": None,
                 "output": plan, "role": "planner", "model": config.planner_model,
             })
+            checkpoint()
 
             for turn in range(config.max_turns):
                 last_turn = turn == config.max_turns - 1
@@ -819,6 +858,7 @@ class InteractAgent:
                         "role": "executor",
                         "model": config.executor_model,
                     })
+                    checkpoint()
                     break
 
                 tool_calls = exec_result["tool_calls"]
@@ -832,6 +872,7 @@ class InteractAgent:
                         "role": "executor",
                         "model": config.executor_model,
                     })
+                    checkpoint()
                     continue
 
                 turn_tool_results: list[tuple[str, dict, str]] = []
@@ -884,6 +925,7 @@ class InteractAgent:
                         "role": "executor",
                         "model": config.scratchpad_model,
                     })
+                checkpoint()
         except Exception as exc:  # noqa: BLE001 -- save the partial trace rather than losing it
             error = repr(exc)
             _debug(f"answer() failed mid-run: {error}")
@@ -893,6 +935,7 @@ class InteractAgent:
                 "arguments": None,
                 "output": f"Agent failed mid-run: {error}",
             })
+            checkpoint()
 
         return AgentResult(
             query_id=query_id,

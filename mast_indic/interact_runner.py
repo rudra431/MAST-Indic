@@ -33,16 +33,26 @@ def run_language(language: str, limit: int | None = None, save_transcripts: bool
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, f"interact_{language}.jsonl")
 
+    # Per-query checkpoint files: InteractAgent.answer() overwrites
+    # checkpoint_path with the trajectory-so-far (scratchpad included)
+    # after every turn, so a hard crash/kill mid-query -- not just the
+    # exceptions caught below and inside answer() itself -- still leaves
+    # the latest completed turn on disk. Removed once a query's real
+    # record lands in out_path; left behind otherwise for postmortem.
+    checkpoint_dir = os.path.join(out_dir, "checkpoints", language)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
     num_failed = 0
     with open(out_path, "w", encoding="utf-8") as f:
         for q in tqdm(queries, desc=f"answering [interact/{language}]"):
+            checkpoint_path = os.path.join(checkpoint_dir, f"{q.qid}.json")
             try:
                 # answer() itself catches mid-run failures (timeouts,
                 # connection drops, 5xx) and returns whatever partial trace
                 # it gathered rather than raising -- this except is now only
                 # a last-resort safety net for something unexpected outside
                 # that (e.g. a bug in our own code before any LLM call).
-                agent_result = agent.answer(q.qid, q.query, language=q.language)
+                agent_result = agent.answer(q.qid, q.query, language=q.language, checkpoint_path=checkpoint_path)
             except Exception as exc:  # noqa: BLE001 -- one bad query must not sink the batch
                 num_failed += 1
                 tqdm.write(f"[error] {q.qid} failed after retries: {exc!r}")
@@ -75,6 +85,10 @@ def run_language(language: str, limit: int | None = None, save_transcripts: bool
             if save_transcripts:
                 record["transcript"] = agent_result.transcript
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            try:
+                os.remove(checkpoint_path)
+            except OSError:
+                pass  # nothing was ever written (e.g. failed before the planner call) -- fine
 
     print(f"Wrote {len(queries)} records ({num_failed} failed) -> {out_path}")
     return out_path

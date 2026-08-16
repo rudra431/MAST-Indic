@@ -1,0 +1,1415 @@
+<meta charset="UTF-8" />
+<title>Interact-RAG Trace Viewer</title>
+<style>
+  /* ---------------------------------------------------------------------
+     Tokens. "Sonar sweep" identity: an amber return-signal accent against
+     a cool instrument-panel slate, echoing the subject (a search agent
+     pinging a corpus and reading back scored returns). Role identity
+     (Planner / Reasoner / Executor) is a separate, deliberately muted
+     hue set so it never competes with the vivid semantic decision colors
+     (Proceed / Reflect & Refine / Conclude).
+     ------------------------------------------------------------------ */
+  :root {
+    --ink: #171a1f;
+    --ink-muted: #5b6472;
+    --ground: #eef1f4;
+    --surface: #ffffff;
+    --surface-2: #f5f7f9;
+    --border: #dbe1e7;
+    --border-soft: #e6eaee;
+    --accent: #b5721f;
+    --accent-ink: #ffffff;
+    --accent-soft: #f7e6cd;
+
+    --state-proceed: #b5721f;
+    --state-proceed-soft: #f7e6cd;
+    --state-reflect: #b4432f;
+    --state-reflect-soft: #fae1dc;
+    --state-conclude: #2f7d68;
+    --state-conclude-soft: #dcf0e9;
+
+    --role-planner: #6a63a8;
+    --role-reasoner: #3d7f9c;
+    --role-executor: #a6743f;
+
+    --font-mono: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Consolas, "Liberation Mono", monospace;
+    --font-body: Charter, "Iowan Old Style", Georgia, "Noto Serif", serif;
+
+    --shadow-1: 0 1px 2px rgba(23, 26, 31, 0.06);
+    --shadow-2: 0 6px 20px -6px rgba(23, 26, 31, 0.18);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ink: #e7eaee;
+      --ink-muted: #8b93a1;
+      --ground: #11141a;
+      --surface: #171b22;
+      --surface-2: #1d222a;
+      --border: #2b313c;
+      --border-soft: #232830;
+      --accent: #e3a458;
+      --accent-ink: #171106;
+      --accent-soft: #3a2c17;
+
+      --state-proceed: #e3a458;
+      --state-proceed-soft: #3a2c17;
+      --state-reflect: #e2735c;
+      --state-reflect-soft: #3b211c;
+      --state-conclude: #5fbd9f;
+      --state-conclude-soft: #163229;
+
+      --role-planner: #a29bd6;
+      --role-reasoner: #7fb2cc;
+      --role-executor: #d4a370;
+
+      --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.3);
+      --shadow-2: 0 10px 30px -8px rgba(0, 0, 0, 0.55);
+    }
+  }
+  :root[data-theme="dark"] {
+    --ink: #e7eaee; --ink-muted: #8b93a1; --ground: #11141a; --surface: #171b22;
+    --surface-2: #1d222a; --border: #2b313c; --border-soft: #232830;
+    --accent: #e3a458; --accent-ink: #171106; --accent-soft: #3a2c17;
+    --state-proceed: #e3a458; --state-proceed-soft: #3a2c17;
+    --state-reflect: #e2735c; --state-reflect-soft: #3b211c;
+    --state-conclude: #5fbd9f; --state-conclude-soft: #163229;
+    --role-planner: #a29bd6; --role-reasoner: #7fb2cc; --role-executor: #d4a370;
+    --shadow-1: 0 1px 2px rgba(0,0,0,.3); --shadow-2: 0 10px 30px -8px rgba(0,0,0,.55);
+  }
+  :root[data-theme="light"] {
+    --ink: #171a1f; --ink-muted: #5b6472; --ground: #eef1f4; --surface: #ffffff;
+    --surface-2: #f5f7f9; --border: #dbe1e7; --border-soft: #e6eaee;
+    --accent: #b5721f; --accent-ink: #ffffff; --accent-soft: #f7e6cd;
+    --state-proceed: #b5721f; --state-proceed-soft: #f7e6cd;
+    --state-reflect: #b4432f; --state-reflect-soft: #fae1dc;
+    --state-conclude: #2f7d68; --state-conclude-soft: #dcf0e9;
+    --role-planner: #6a63a8; --role-reasoner: #3d7f9c; --role-executor: #a6743f;
+    --shadow-1: 0 1px 2px rgba(23,26,31,.06); --shadow-2: 0 6px 20px -6px rgba(23,26,31,.18);
+  }
+
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    color: var(--ink);
+    background: var(--ground);
+    font-family: var(--font-body);
+    font-size: 15px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+  ::selection { background: var(--accent-soft); }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+
+  button { font-family: inherit; cursor: pointer; }
+
+  .app {
+    display: grid;
+    grid-template-columns: 300px 1fr;
+    height: 100vh;
+    min-height: 560px;
+    min-width: 0;
+    overflow: hidden;
+  }
+  @media (max-width: 860px) {
+    .app { grid-template-columns: 1fr; height: auto; min-height: 100vh; overflow: visible; }
+    .rail { height: auto; max-height: 40vh; overflow-y: auto; }
+  }
+
+  /* ---------------- Left rail: run loader + query browser ---------------- */
+  .rail {
+    background: var(--surface);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+    height: 100%;
+    overflow-y: auto;
+    overflow-x: hidden;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-gutter: stable;
+  }
+  .rail-head {
+    padding: 16px 16px 12px;
+    border-bottom: 1px solid var(--border-soft);
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .brand {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+  }
+  .brand .mark {
+    font-family: var(--font-mono);
+    font-weight: 700;
+    font-size: 13px;
+    letter-spacing: 0.02em;
+    color: var(--accent);
+  }
+  .brand h1 {
+    font-family: var(--font-mono);
+    font-size: 14px;
+    font-weight: 600;
+    margin: 0;
+    letter-spacing: 0.01em;
+  }
+  .brand .sub {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--ink-muted);
+  }
+
+  .dropzone {
+    border: 1.5px dashed var(--border);
+    border-radius: 10px;
+    padding: 12px 10px;
+    text-align: center;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--ink-muted);
+    transition: border-color 0.15s, background 0.15s;
+    position: relative;
+  }
+  .dropzone.drag {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+    color: var(--ink);
+  }
+  .dropzone input[type="file"] {
+    position: absolute;
+    inset: 0;
+    opacity: 0;
+    cursor: pointer;
+  }
+  .dropzone .dz-title { color: var(--ink); font-weight: 600; margin-bottom: 2px; }
+  .dropzone .dz-hint { opacity: 0.85; }
+
+  .rail-actions {
+    display: flex;
+    gap: 6px;
+  }
+  .btn-ghost {
+    flex: 1;
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--ink-muted);
+    border-radius: 7px;
+    padding: 6px 8px;
+    font-size: 11.5px;
+    font-family: var(--font-mono);
+    letter-spacing: 0.02em;
+  }
+  .btn-ghost:hover { border-color: var(--accent); color: var(--ink); }
+
+  .rail-search {
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border-soft);
+  }
+  .rail-search input {
+    width: 100%;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 7px 10px;
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    color: var(--ink);
+  }
+  .rail-search input::placeholder { color: var(--ink-muted); }
+
+  .rail-list {
+    flex: 0 0 auto;
+    overflow: visible;
+    padding: 6px;
+    min-height: 0;
+  }
+  .rail-empty {
+    padding: 30px 18px;
+    text-align: center;
+    color: var(--ink-muted);
+    font-size: 13px;
+  }
+
+  .q-item {
+    width: 100%;
+    text-align: left;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 9px;
+    padding: 9px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    margin-bottom: 2px;
+  }
+  .q-item:hover { background: var(--surface-2); }
+  .q-item.active { background: var(--accent-soft); border-color: var(--accent); }
+  .q-item .q-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .q-id {
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--ink);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .q-item .q-preview {
+    font-size: 12px;
+    color: var(--ink-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    line-height: 1.35;
+  }
+  .q-item .q-meta {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    color: var(--ink-muted);
+  }
+
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 7px;
+    border-radius: 999px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+    white-space: nowrap;
+    line-height: 1.6;
+  }
+  .pill-proceed { color: var(--state-proceed); background: var(--state-proceed-soft); }
+  .pill-reflect_refine { color: var(--state-reflect); background: var(--state-reflect-soft); }
+  .pill-conclude { color: var(--state-conclude); background: var(--state-conclude-soft); }
+  .pill-done { color: var(--state-conclude); background: var(--state-conclude-soft); }
+  .pill-failed { color: var(--state-reflect); background: var(--state-reflect-soft); }
+  .pill-open { color: var(--ink-muted); background: var(--surface-2); border: 1px solid var(--border); }
+
+  /* ---------------- Main pane ---------------- */
+  .main {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    overflow: hidden;
+  }
+  .main-empty {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+    gap: 10px;
+    text-align: center;
+    padding: 40px;
+    color: var(--ink-muted);
+  }
+  .main-empty .ping {
+    width: 46px; height: 46px; border-radius: 50%;
+    border: 2px solid var(--accent);
+    display: flex; align-items: center; justify-content: center;
+    color: var(--accent);
+    font-family: var(--font-mono);
+    font-size: 18px;
+    margin-bottom: 6px;
+  }
+  .main-empty h2 { font-family: var(--font-mono); font-size: 15px; color: var(--ink); margin: 0; }
+  .main-empty p { max-width: 420px; margin: 0; font-size: 13.5px; }
+
+  .topbar {
+    padding: 16px 24px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    flex-shrink: 0;
+  }
+  .topbar .qid-row {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .topbar .qid-row .qid {
+    font-family: var(--font-mono);
+    font-size: 17px;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+  }
+  .stat-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .stat-chip {
+    display: flex;
+    align-items: baseline;
+    gap: 5px;
+    background: var(--surface-2);
+    border: 1px solid var(--border-soft);
+    border-radius: 7px;
+    padding: 4px 9px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--ink-muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .stat-chip b { color: var(--ink); font-weight: 700; }
+  .stat-chip .tc-name { color: var(--ink-muted); }
+
+  .question-box {
+    background: var(--surface-2);
+    border: 1px solid var(--border-soft);
+    border-left: 3px solid var(--role-planner);
+    border-radius: 0 8px 8px 0;
+    padding: 10px 14px;
+    font-family: var(--font-body);
+    font-size: 14px;
+    color: var(--ink);
+  }
+  .question-box .lbl {
+    display: block;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--ink-muted);
+    margin-bottom: 3px;
+  }
+  .question-box.unknown { color: var(--ink-muted); font-style: italic; font-family: var(--font-mono); font-size: 12px; }
+
+  .timeline-scroll {
+    flex: 1;
+    overflow-y: auto;
+    padding: 22px 24px 60px;
+  }
+  .timeline {
+    max-width: 760px;
+    margin: 0 auto;
+    position: relative;
+  }
+  .timeline::before {
+    content: "";
+    position: absolute;
+    left: 19px;
+    top: 6px;
+    bottom: 6px;
+    width: 2px;
+    background: var(--border);
+  }
+
+  .turn {
+    position: relative;
+    padding-left: 52px;
+    margin-bottom: 22px;
+  }
+  .turn-badge {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    background: var(--surface);
+    border: 2px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: var(--font-mono);
+    font-weight: 700;
+    font-size: 13px;
+    color: var(--ink-muted);
+    z-index: 1;
+  }
+  .turn-label {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--ink-muted);
+    margin-bottom: 8px;
+    padding-top: 8px;
+  }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    margin-bottom: 10px;
+    box-shadow: var(--shadow-1);
+    overflow: hidden;
+  }
+  .card-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 9px 13px;
+    border-bottom: 1px solid var(--border-soft);
+    background: var(--surface-2);
+  }
+  .role-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .role-planner-dot { background: var(--role-planner); }
+  .role-reasoner-dot { background: var(--role-reasoner); }
+  .role-executor-dot { background: var(--role-executor); }
+
+  .card-head .role-name {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    font-weight: 700;
+    letter-spacing: 0.01em;
+  }
+  .card-head .model-tag {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    color: var(--ink-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 200px;
+  }
+  .card-head .spacer { flex: 1; }
+
+  .card-body { padding: 12px 14px; }
+  .card-body p { margin: 0; }
+  .analysis-text {
+    font-family: var(--font-body);
+    font-size: 14.5px;
+    line-height: 1.6;
+    color: var(--ink);
+    white-space: pre-wrap;
+  }
+  .plan-text { white-space: pre-wrap; }
+
+  .toolcall-sig {
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    color: var(--ink);
+    margin-bottom: 8px;
+  }
+  .toolcall-sig .fn { color: var(--accent); font-weight: 700; }
+  .toolcall-sig .args { color: var(--ink-muted); }
+
+  .note-text {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--ink-muted);
+    font-style: italic;
+  }
+
+  .hits-scroll {
+    display: flex;
+    gap: 8px;
+    overflow-x: auto;
+    padding-bottom: 4px;
+    margin: 0 -2px;
+  }
+  .hit-card {
+    flex: 0 0 220px;
+    border: 1px solid var(--border-soft);
+    background: var(--surface-2);
+    border-radius: 8px;
+    padding: 9px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .hit-card .hit-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+  }
+  .hit-docid {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--ink);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .hit-score {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    color: var(--accent);
+    font-variant-numeric: tabular-nums;
+    flex-shrink: 0;
+  }
+  .hit-meter {
+    height: 3px;
+    border-radius: 2px;
+    background: var(--border-soft);
+    overflow: hidden;
+  }
+  .hit-meter > span {
+    display: block;
+    height: 100%;
+    background: var(--accent);
+  }
+  .hit-snippet {
+    font-family: var(--font-body);
+    font-size: 12px;
+    line-height: 1.45;
+    color: var(--ink-muted);
+    display: -webkit-box;
+    -webkit-line-clamp: 4;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+  .hit-url {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .hits-empty { font-family: var(--font-mono); font-size: 12px; color: var(--ink-muted); font-style: italic; }
+
+  .decision-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+  }
+
+  .verdict {
+    position: relative;
+    padding-left: 52px;
+    margin-top: 30px;
+  }
+  .verdict-badge {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    background: var(--state-conclude-soft);
+    border: 2px solid var(--state-conclude);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--state-conclude);
+    font-size: 18px;
+    z-index: 1;
+  }
+  .verdict-card {
+    border: 1.5px solid var(--state-conclude);
+    border-radius: 12px;
+    background: var(--surface);
+    box-shadow: var(--shadow-2);
+    overflow: hidden;
+  }
+  .verdict-card .card-head { background: var(--state-conclude-soft); border-bottom-color: var(--state-conclude); }
+  .verdict-card .card-head .role-name { color: var(--state-conclude); }
+  .verdict-line {
+    display: flex;
+    gap: 10px;
+    padding: 4px 0;
+    font-size: 14.5px;
+  }
+  .verdict-line .vk {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    color: var(--ink-muted);
+    flex: 0 0 90px;
+    padding-top: 3px;
+  }
+  .verdict-line .vv { font-family: var(--font-body); }
+  .verdict-line .vv.answer { font-weight: 700; font-size: 16px; }
+  .verdict-failed { border-color: var(--state-reflect); }
+  .verdict-failed .card-head { background: var(--state-reflect-soft); border-bottom-color: var(--state-reflect); }
+  .verdict-failed .verdict-badge { background: var(--state-reflect-soft); border-color: var(--state-reflect); color: var(--state-reflect); }
+  .verdict-failed .card-head .role-name { color: var(--state-reflect); }
+
+  .kbd-hint {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    color: var(--ink-muted);
+    padding: 8px 24px;
+    border-top: 1px solid var(--border-soft);
+    background: var(--surface);
+    flex-shrink: 0;
+  }
+  .kbd-hint kbd {
+    font-family: var(--font-mono);
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1px 5px;
+    font-size: 10px;
+  }
+
+  /* ---------------- UI motion ---------------------------------------------
+     Lightweight motion keeps the trace feeling "alive" without making the
+     interface feel like a presentation. All motion is disabled for users who
+     prefer reduced motion.
+     ------------------------------------------------------------------------- */
+  @media (prefers-reduced-motion: no-preference) {
+    @keyframes railItemIn {
+      from { opacity: 0; transform: translateX(-8px); }
+      to   { opacity: 1; transform: translateX(0); }
+    }
+
+    @keyframes softPulse {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(181, 114, 31, 0); }
+      50%      { box-shadow: 0 0 0 5px rgba(181, 114, 31, 0.08); }
+    }
+
+    @keyframes chipIn {
+      from { opacity: 0; transform: translateY(5px) scale(.98); }
+      to   { opacity: 1; transform: translateY(0) scale(1); }
+    }
+
+    @keyframes questionIn {
+      from { opacity: 0; transform: translateY(8px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+
+    .q-item {
+      animation: railItemIn .32s cubic-bezier(.16,1,.3,1) both;
+    }
+
+    .q-item:nth-child(2) { animation-delay: 25ms; }
+    .q-item:nth-child(3) { animation-delay: 50ms; }
+    .q-item:nth-child(4) { animation-delay: 75ms; }
+    .q-item:nth-child(5) { animation-delay: 100ms; }
+
+    .q-item.active {
+      animation: railItemIn .32s cubic-bezier(.16,1,.3,1) both,
+                 softPulse 1.8s ease-in-out .35s 1;
+    }
+
+    .q-item,
+    .btn-ghost,
+    .dropzone,
+    .stat-chip,
+    .hit-card {
+      transition:
+        transform .2s cubic-bezier(.16,1,.3,1),
+        border-color .2s ease,
+        background-color .2s ease,
+        box-shadow .2s ease;
+    }
+
+    .q-item:hover { transform: translateX(3px); }
+    .btn-ghost:hover { transform: translateY(-1px); }
+    .dropzone:hover { transform: translateY(-1px); }
+
+    .stat-chip {
+      animation: chipIn .35s cubic-bezier(.16,1,.3,1) both;
+    }
+
+    .question-box {
+      animation: questionIn .45s cubic-bezier(.16,1,.3,1) both;
+    }
+
+    .hit-card:hover {
+      transform: translateY(-3px);
+      box-shadow: var(--shadow-2);
+    }
+
+    .hit-meter > span {
+      transform-origin: left center;
+      animation: meterGrow .7s cubic-bezier(.16,1,.3,1) both;
+    }
+
+    @keyframes meterGrow {
+      from { transform: scaleX(0); }
+      to   { transform: scaleX(1); }
+    }
+
+    .timeline-scroll {
+      scroll-behavior: smooth;
+      overscroll-behavior: contain;
+      scrollbar-gutter: stable;
+    }
+  }
+
+  /* Keep the inner trace independently scrollable on desktop and mobile. */
+  .timeline-scroll {
+    min-height: 0;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior-y: contain;
+    touch-action: pan-y;
+  }
+
+  /* ---------------- Reveal animations: each turn/card animates in as you
+     scroll it into view (IntersectionObserver toggles .in-view -- see the
+     script), rather than all at once on load, so scrolling down through a
+     trace visibly walks through it turn by turn, step by step. ---------- */
+  @media (prefers-reduced-motion: no-preference) {
+    @keyframes badgePop {
+      from { opacity: 0; transform: scale(0.55); }
+      to   { opacity: 1; transform: scale(1); }
+    }
+    @keyframes lineGrow {
+      from { transform: scaleY(0); }
+      to   { transform: scaleY(1); }
+    }
+    .timeline::before {
+      animation: lineGrow 0.7s ease-out both;
+      transform-origin: top;
+    }
+    .turn, .verdict {
+      opacity: 0;
+      transform: translateY(28px);
+      transition: opacity 0.55s cubic-bezier(0.16, 1, 0.3, 1),
+                  transform 0.55s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+    .turn.in-view, .verdict.in-view {
+      opacity: 1;
+      transform: translateY(0);
+    }
+    .turn.in-view .turn-badge, .verdict.in-view .verdict-badge {
+      animation: badgePop 0.4s cubic-bezier(0.34, 1.56, 0.64, 1) both;
+    }
+    /* Cards/hits are hidden until their turn is in view, then cascade in
+       via each element's own transition-delay (set inline in JS) so the
+       turn's contents ripple in shortly after the turn itself appears. */
+    .turn .card, .verdict .card, .turn .hit-card {
+      opacity: 0;
+      transform: translateY(14px);
+      transition: opacity 0.4s cubic-bezier(0.16, 1, 0.3, 1),
+                  transform 0.4s cubic-bezier(0.16, 1, 0.3, 1),
+                  box-shadow 0.15s;
+    }
+    .turn.in-view .card, .verdict.in-view .card, .turn.in-view .hit-card {
+      opacity: 1;
+      transform: translateY(0);
+    }
+    .turn.in-view .card:hover, .verdict.in-view .card:hover {
+      box-shadow: var(--shadow-2);
+      transform: translateY(-1px);
+    }
+  }
+</style>
+
+<div class="app">
+  <aside class="rail">
+    <div class="rail-head">
+      <div class="brand">
+        <span class="mark">◈</span>
+        <div>
+          <h1>Trace Viewer</h1>
+          <div class="sub">Interact-RAG · Planner / Reasoner / Executor</div>
+        </div>
+      </div>
+      <div class="dropzone" id="dropzone">
+        <input type="file" id="fileInput" accept=".jsonl,.json,.txt" />
+        <div class="dz-title">Drop a run .jsonl</div>
+        <div class="dz-hint">or click to browse — nothing leaves your browser</div>
+      </div>
+      <div class="rail-actions">
+        <button class="btn-ghost" id="demoBtn">Load sample trace</button>
+      </div>
+    </div>
+    <div class="rail-search">
+      <input type="text" id="searchBox" placeholder="Filter by query_id…" />
+    </div>
+    <div class="rail-list" id="railList">
+      <div class="rail-empty">No run loaded yet.</div>
+    </div>
+  </aside>
+
+  <main class="main" id="main">
+    <div class="main-empty" id="mainEmpty">
+      <div class="ping">◎</div>
+      <h2>Nothing selected</h2>
+      <p>Load a run JSONL written by <code>interact_runner.py</code> (or the sample trace) on the
+      left, then pick a query to walk through its Planner → Reasoner → Executor turns.</p>
+    </div>
+  </main>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  var records = [];
+  var activeIndex = -1;
+
+  var railList = document.getElementById("railList");
+  var main = document.getElementById("main");
+  var mainEmpty = document.getElementById("mainEmpty");
+  var searchBox = document.getElementById("searchBox");
+  var dropzone = document.getElementById("dropzone");
+  var fileInput = document.getElementById("fileInput");
+  var demoBtn = document.getElementById("demoBtn");
+
+  // ---- scroll-triggered reveal --------------------------------------------
+  // Adds .in-view (see the CSS) the first time an element scrolls into the
+  // viewport, then stops watching it -- so turns/verdicts animate in as you
+  // scroll down through a trace instead of all at once when it's loaded.
+  // Falls back to revealing immediately if IntersectionObserver isn't
+  // available at all.
+  var revealObserver = (typeof IntersectionObserver !== "undefined")
+    ? new IntersectionObserver(function (entries) {
+        entries.forEach(function (entry) {
+          if (entry.isIntersecting) {
+            entry.target.classList.add("in-view");
+            revealObserver.unobserve(entry.target);
+          }
+        });
+      }, { threshold: 0.12, rootMargin: "0px 0px -8% 0px" })
+    : null;
+
+  function observeReveal(elm) {
+    if (revealObserver) revealObserver.observe(elm);
+    else elm.classList.add("in-view");
+  }
+
+  // ---- parsing -----------------------------------------------------------
+
+  function parseJsonl(text) {
+    var out = [];
+    var lines = text.split(/\r?\n/);
+    for (var i = 0; i < lines.length; i++) {
+      var line = lines[i].trim();
+      if (!line) continue;
+      try { out.push(JSON.parse(line)); }
+      catch (e) { /* skip malformed line rather than aborting the whole load */ }
+    }
+    return out;
+  }
+
+  function tryParseJson(text) {
+    try { return JSON.parse(text); } catch (e) { return null; }
+  }
+
+  // Groups the flat `result` trace into turns: the single planner entry is
+  // Turn 0 ("Planning"); every subsequent role:"reasoner" reasoning entry
+  // opens a new turn, and everything after it (executor tool calls / notes)
+  // belongs to that turn until the next reasoner entry or the final answer.
+  function groupTurns(result) {
+    var turns = [];
+    var current = null;
+    var planner = null;
+    var verdict = null;
+
+    (result || []).forEach(function (entry) {
+      if (entry.type === "output_text") {
+        verdict = entry;
+        return;
+      }
+      if (entry.role === "planner") {
+        planner = entry;
+        return;
+      }
+      if (entry.role === "reasoner" && entry.type === "reasoning") {
+        current = { reasoner: entry, steps: [] };
+        turns.push(current);
+        return;
+      }
+      if (!current) {
+        current = { reasoner: null, steps: [] };
+        turns.push(current);
+      }
+      current.steps.push(entry);
+    });
+
+    return { planner: planner, turns: turns, verdict: verdict };
+  }
+
+  function extractQuestion(record) {
+    var t = record.transcript;
+    if (Array.isArray(t)) {
+      for (var i = 0; i < t.length; i++) {
+        if (t[i] && t[i].role_call === "planner" && Array.isArray(t[i].messages)) {
+          var msgs = t[i].messages;
+          for (var j = 0; j < msgs.length; j++) {
+            if (msgs[j].role === "user") return msgs[j].content;
+          }
+        }
+      }
+    }
+    return null;
+  }
+
+  function summarize(record) {
+    var grouped = groupTurns(record.result);
+    var toolCounts = record.tool_call_counts || {};
+    var totalCalls = 0;
+    Object.keys(toolCounts).forEach(function (k) { totalCalls += toolCounts[k]; });
+    var docSet = {};
+    (record.retrieved_docids || []).forEach(function (round) {
+      (round || []).forEach(function (d) { docSet[d] = true; });
+    });
+    var status = "open";
+    if (record.error) status = "failed";
+    else if (grouped.verdict) status = "done";
+    return {
+      grouped: grouped,
+      totalCalls: totalCalls,
+      uniqueDocs: Object.keys(docSet).length,
+      status: status,
+      question: extractQuestion(record),
+    };
+  }
+
+  // ---- rail rendering -----------------------------------------------------
+
+  function renderRail() {
+    var q = (searchBox.value || "").toLowerCase();
+    railList.innerHTML = "";
+    if (!records.length) {
+      var empty = document.createElement("div");
+      empty.className = "rail-empty";
+      empty.textContent = "No run loaded yet.";
+      railList.appendChild(empty);
+      return;
+    }
+    var shown = 0;
+    records.forEach(function (rec, i) {
+      var qid = String(rec.query_id || "(no query_id)");
+      if (q && qid.toLowerCase().indexOf(q) === -1) return;
+      shown++;
+      var s = summarize(rec);
+      var btn = document.createElement("button");
+      btn.className = "q-item" + (i === activeIndex ? " active" : "");
+      btn.setAttribute("data-idx", i);
+
+      var top = document.createElement("div");
+      top.className = "q-top";
+      var idEl = document.createElement("span");
+      idEl.className = "q-id";
+      idEl.textContent = qid;
+      var pill = document.createElement("span");
+      pill.className = "pill pill-" + s.status;
+      pill.textContent = s.status === "done" ? "done" : s.status === "failed" ? "failed" : "open";
+      top.appendChild(idEl);
+      top.appendChild(pill);
+      btn.appendChild(top);
+
+      if (s.question) {
+        var prev = document.createElement("div");
+        prev.className = "q-preview";
+        prev.textContent = s.question;
+        btn.appendChild(prev);
+      }
+
+      var meta = document.createElement("div");
+      meta.className = "q-meta";
+      meta.innerHTML =
+        "<span>" + s.grouped.turns.length + " turn" + (s.grouped.turns.length === 1 ? "" : "s") + "</span>" +
+        "<span>·</span><span>" + s.totalCalls + " call" + (s.totalCalls === 1 ? "" : "s") + "</span>" +
+        "<span>·</span><span>" + s.uniqueDocs + " doc" + (s.uniqueDocs === 1 ? "" : "s") + "</span>";
+      btn.appendChild(meta);
+
+      btn.addEventListener("click", function () { selectRecord(i); });
+      railList.appendChild(btn);
+    });
+    if (!shown) {
+      var noMatch = document.createElement("div");
+      noMatch.className = "rail-empty";
+      noMatch.textContent = "No query_id matches “" + searchBox.value + "”.";
+      railList.appendChild(noMatch);
+    }
+  }
+
+  // ---- main pane rendering --------------------------------------------------
+
+  function el(tag, className, html) {
+    var e = document.createElement(tag);
+    if (className) e.className = className;
+    if (html !== undefined) e.innerHTML = html;
+    return e;
+  }
+
+  function escapeHtml(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  function roleDot(role) {
+    return '<span class="role-dot role-' + role + '-dot"></span>';
+  }
+
+  function renderHits(outputRaw, baseDelayMs) {
+    var parsed = tryParseJson(outputRaw);
+    if (!Array.isArray(parsed)) {
+      return '<div class="note-text">' + escapeHtml(outputRaw) + "</div>";
+    }
+    if (!parsed.length) {
+      return '<div class="hits-empty">No matching chunks returned.</div>';
+    }
+    var maxScore = 0;
+    parsed.forEach(function (h) { if (typeof h.score === "number") maxScore = Math.max(maxScore, h.score); });
+    maxScore = maxScore || 1;
+    var html = '<div class="hits-scroll">';
+    parsed.forEach(function (h, idx) {
+      var pct = Math.max(4, Math.min(100, Math.round(((h.score || 0) / maxScore) * 100)));
+      // Ripples in just after its own tool-call card (baseDelayMs), rather
+      // than racing that card's own reveal the moment the turn comes into view.
+      var hitDelay = (baseDelayMs || 0) + 60 + Math.min(idx * 45, 360);
+      html +=
+        '<div class="hit-card" style="transition-delay:' + hitDelay + 'ms">' +
+          '<div class="hit-top"><span class="hit-docid">#' + escapeHtml(h.docid) + '</span>' +
+          '<span class="hit-score">' + (typeof h.score === "number" ? h.score.toFixed(4) : "—") + '</span></div>' +
+          '<div class="hit-meter"><span style="width:' + pct + '%"></span></div>' +
+          '<div class="hit-snippet">' + escapeHtml(h.snippet || "") + '</div>' +
+          (h.url ? '<a class="hit-url" href="' + escapeHtml(h.url) + '" target="_blank" rel="noopener">' + escapeHtml(h.url) + '</a>' : "") +
+        '</div>';
+    });
+    html += "</div>";
+    return html;
+  }
+
+  function renderPlannerCard(entry) {
+    var card = el("div", "card");
+    card.innerHTML =
+      '<div class="card-head">' + roleDot("planner") +
+        '<span class="role-name" style="color:var(--role-planner)">Global-Planner</span>' +
+        '<span class="spacer"></span>' +
+        '<span class="model-tag" title="' + escapeHtml(entry.model) + '">' + escapeHtml(entry.model || "") + '</span>' +
+      '</div>' +
+      '<div class="card-body"><div class="analysis-text plan-text">' + escapeHtml(entry.output) + '</div></div>';
+    return card;
+  }
+
+  function renderReasonerCard(entry) {
+    var decision = entry.decision && entry.decision.decision;
+    var label = decision === "conclude" ? "Conclude" : decision === "reflect_refine" ? "Reflect & Refine" : "Proceed";
+    var card = el("div", "card");
+    card.innerHTML =
+      '<div class="card-head">' + roleDot("reasoner") +
+        '<span class="role-name" style="color:var(--role-reasoner)">Adaptive-Reasoner</span>' +
+        '<span class="spacer"></span>' +
+        '<span class="model-tag" title="' + escapeHtml(entry.model) + '">' + escapeHtml(entry.model || "") + '</span>' +
+      '</div>' +
+      '<div class="card-body">' +
+        '<div class="decision-row"><span class="pill pill-' + (decision || "proceed") + '">' + label + '</span></div>' +
+        '<div class="analysis-text">' + escapeHtml((entry.decision && entry.decision.analysis) || entry.output) + '</div>' +
+      '</div>';
+    return card;
+  }
+
+  function renderExecutorStep(entry, baseDelayMs) {
+    var card = el("div", "card");
+    if (entry.type === "tool_call") {
+      var args = tryParseJson(entry.arguments);
+      var argStr = args ? JSON.stringify(args) : (entry.arguments || "");
+      card.innerHTML =
+        '<div class="card-head">' + roleDot("executor") +
+          '<span class="role-name" style="color:var(--role-executor)">Executor</span>' +
+          '<span class="spacer"></span>' +
+          '<span class="model-tag" title="' + escapeHtml(entry.model) + '">' + escapeHtml(entry.model || "") + '</span>' +
+        '</div>' +
+        '<div class="card-body">' +
+          '<div class="toolcall-sig"><span class="fn">' + escapeHtml(entry.tool_name) + '(</span>' +
+          '<span class="args">' + escapeHtml(argStr) + '</span><span class="fn">)</span></div>' +
+          renderHits(entry.output, baseDelayMs) +
+        '</div>';
+    } else {
+      card.innerHTML =
+        '<div class="card-head">' + roleDot("executor") +
+          '<span class="role-name" style="color:var(--role-executor)">Executor</span>' +
+          '<span class="spacer"></span>' +
+          '<span class="model-tag" title="' + escapeHtml(entry.model) + '">' + escapeHtml(entry.model || "") + '</span>' +
+        '</div>' +
+        '<div class="card-body"><div class="note-text">' + escapeHtml(entry.output) + '</div></div>';
+    }
+    return card;
+  }
+
+  function splitVerdict(text) {
+    var m = /Explanation:\s*([\s\S]*?)(?:\n\s*Exact Answer:\s*([\s\S]*))?$/i.exec(text || "");
+    if (m && (m[1] || m[2])) {
+      return { explanation: (m[1] || "").trim(), answer: (m[2] || "").trim() };
+    }
+    return { explanation: text || "", answer: "" };
+  }
+
+  function renderQuery(record) {
+    main.innerHTML = "";
+    var s = summarize(record);
+    var grouped = s.grouped;
+
+    // -- sticky header --
+    var top = el("div", "topbar");
+    var qidRow = el("div", "qid-row");
+    qidRow.innerHTML =
+      '<span class="qid">' + escapeHtml(record.query_id) + '</span>' +
+      '<span class="pill pill-' + s.status + '">' + (s.status === "done" ? "Completed" : s.status === "failed" ? "Failed" : "Incomplete") + '</span>';
+    top.appendChild(qidRow);
+
+    var stats = el("div", "stat-row");
+    var chips = [
+      ["lang", record.language],
+      ["llm", record.llm],
+      ["retriever", record.retriever],
+      ["turns", grouped.turns.length],
+      ["docs", s.uniqueDocs],
+    ];
+    chips.forEach(function (c) {
+      if (c[1] === undefined || c[1] === null || c[1] === "") return;
+      var chip = el("div", "stat-chip");
+      chip.innerHTML = escapeHtml(c[0]) + ' <b>' + escapeHtml(c[1]) + '</b>';
+      stats.appendChild(chip);
+    });
+    Object.keys(record.tool_call_counts || {}).forEach(function (name) {
+      var chip = el("div", "stat-chip");
+      chip.innerHTML = '<span class="tc-name">' + escapeHtml(name) + '</span> <b>×' + record.tool_call_counts[name] + '</b>';
+      stats.appendChild(chip);
+    });
+    top.appendChild(stats);
+
+    var qbox = el("div", "question-box" + (s.question ? "" : " unknown"));
+    qbox.innerHTML = s.question
+      ? '<span class="lbl">Original question</span>' + escapeHtml(s.question)
+      : "Original question text unavailable — rerun with --save-transcripts to capture it.";
+    top.appendChild(qbox);
+
+    main.appendChild(top);
+
+    // -- scrolling timeline --
+    // Each .turn/.verdict block starts hidden and gets an .in-view class
+    // (see the CSS) once revealObserver sees it enter the viewport, so
+    // scrolling down through a trace visibly reveals it turn by turn
+    // rather than everything fading in at once on load. Within a turn,
+    // each card gets a small transition-delay of its own (reset per turn)
+    // so its cards ripple in shortly after the turn itself appears.
+    var scroll = el("div", "timeline-scroll");
+    // Make the trace a real keyboard-scroll target as well as a mouse/touch
+    // scroll container. This also prevents page-level key handlers from
+    // stealing the user's ArrowDown/ArrowUp navigation.
+    scroll.tabIndex = 0;
+    scroll.setAttribute("aria-label", "Trace timeline");
+    var timeline = el("div", "timeline");
+    var CARD_STEP_MS = 70;
+    var CARD_STEP_MAX_MS = 260;
+    function cardStagger(counterRef) {
+      var d = Math.min(counterRef.ms, CARD_STEP_MAX_MS);
+      counterRef.ms += CARD_STEP_MS;
+      return d;
+    }
+
+    if (grouped.planner) {
+      var t0 = el("div", "turn");
+      t0.innerHTML = '<div class="turn-badge">◆</div><div class="turn-label">Turn 0 · Planning</div>';
+      var counter0 = { ms: 0 };
+      var plannerCard = renderPlannerCard(grouped.planner);
+      plannerCard.style.transitionDelay = cardStagger(counter0) + "ms";
+      t0.appendChild(plannerCard);
+      timeline.appendChild(t0);
+      observeReveal(t0);
+    }
+
+    grouped.turns.forEach(function (turn, i) {
+      var tEl = el("div", "turn");
+      var badge = el("div", "turn-badge", String(i + 1));
+      tEl.appendChild(badge);
+      tEl.appendChild(el("div", "turn-label", "Turn " + (i + 1)));
+      var counter = { ms: 0 };
+      if (turn.reasoner) {
+        var rCard = renderReasonerCard(turn.reasoner);
+        rCard.style.transitionDelay = cardStagger(counter) + "ms";
+        tEl.appendChild(rCard);
+      }
+      turn.steps.forEach(function (step) {
+        var stepDelayMs = cardStagger(counter);
+        var stepCard = renderExecutorStep(step, stepDelayMs);
+        stepCard.style.transitionDelay = stepDelayMs + "ms";
+        tEl.appendChild(stepCard);
+      });
+      timeline.appendChild(tEl);
+      observeReveal(tEl);
+    });
+
+    if (grouped.verdict) {
+      var v = splitVerdict(grouped.verdict.output);
+      var vEl = el("div", "verdict");
+      vEl.innerHTML = '<div class="verdict-badge">✓</div>';
+      var vCard = el("div", "verdict-card card");
+      vCard.innerHTML =
+        '<div class="card-head">' + roleDot(grouped.verdict.role || "executor") +
+          '<span class="role-name">Final answer · ' + escapeHtml(grouped.verdict.role || "executor") + '</span></div>' +
+        '<div class="card-body">' +
+          '<div class="verdict-line"><span class="vk">Explanation</span><span class="vv">' + escapeHtml(v.explanation) + '</span></div>' +
+          (v.answer ? '<div class="verdict-line"><span class="vk">Exact answer</span><span class="vv answer">' + escapeHtml(v.answer) + '</span></div>' : "") +
+        '</div>';
+      vEl.appendChild(vCard);
+      timeline.appendChild(vEl);
+      observeReveal(vEl);
+    } else if (record.error) {
+      var eEl = el("div", "verdict");
+      eEl.innerHTML = '<div class="verdict-badge" style="background:var(--state-reflect-soft);border-color:var(--state-reflect);color:var(--state-reflect)">✕</div>';
+      var eCard = el("div", "verdict-card verdict-failed card");
+      eCard.innerHTML =
+        '<div class="card-head"><span class="role-name">Run failed</span></div>' +
+        '<div class="card-body"><div class="note-text">' + escapeHtml(record.error) + '</div></div>';
+      eEl.appendChild(eCard);
+      observeReveal(eEl);
+      timeline.appendChild(eEl);
+    }
+
+    scroll.appendChild(timeline);
+    main.appendChild(scroll);
+
+    var hint = el("div", "kbd-hint", 'Use <kbd>↑</kbd> <kbd>↓</kbd> to scroll the trace · <kbd>Alt</kbd> + <kbd>↑</kbd> <kbd>↓</kbd> to switch queries.');
+    main.appendChild(hint);
+  }
+
+  function selectRecord(i) {
+    activeIndex = i;
+    renderRail();
+    renderQuery(records[i]);
+  }
+
+  function loadRecords(recs) {
+    records = recs;
+    activeIndex = recs.length ? 0 : -1;
+    renderRail();
+    if (recs.length) renderQuery(recs[0]);
+  }
+
+  // ---- file loading -----------------------------------------------------
+
+  function handleFile(file) {
+    var reader = new FileReader();
+    reader.onload = function () {
+      var recs = parseJsonl(String(reader.result));
+      if (!recs.length) {
+        alert("Couldn't find any valid JSON lines in that file.");
+        return;
+      }
+      loadRecords(recs);
+    };
+    reader.readAsText(file);
+  }
+
+  fileInput.addEventListener("change", function (e) {
+    if (e.target.files && e.target.files[0]) handleFile(e.target.files[0]);
+  });
+  ["dragenter", "dragover"].forEach(function (evt) {
+    dropzone.addEventListener(evt, function (e) { e.preventDefault(); dropzone.classList.add("drag"); });
+  });
+  ["dragleave", "drop"].forEach(function (evt) {
+    dropzone.addEventListener(evt, function (e) { e.preventDefault(); dropzone.classList.remove("drag"); });
+  });
+  dropzone.addEventListener("drop", function (e) {
+    if (e.dataTransfer.files && e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
+  });
+
+  searchBox.addEventListener("input", renderRail);
+
+  document.addEventListener("keydown", function (e) {
+    if (!records.length) return;
+
+    // Do not hijack the arrow keys while the user is navigating the trace.
+    // ArrowUp / ArrowDown should scroll the .timeline-scroll normally.
+    if (document.activeElement === searchBox) return;
+
+    // Query navigation is now Alt+ArrowUp / Alt+ArrowDown.
+    // Plain arrows remain available for scrolling the example/trace pane.
+    if (e.altKey && e.key === "ArrowDown") {
+      e.preventDefault();
+      selectRecord(Math.min(records.length - 1, activeIndex + 1));
+    }
+    if (e.altKey && e.key === "ArrowUp") {
+      e.preventDefault();
+      selectRecord(Math.max(0, activeIndex - 1));
+    }
+  });
+
+  // ---- bundled sample trace ------------------------------------------------
+  // Mirrors mast_indic/interact_agent.py's exact record/result shape, so the
+  // viewer is legible before you ever load a real run file.
+  var SAMPLE = [
+    {
+      query_id: "hi-798",
+      language: "hi",
+      retriever: "interact-rag/embeddinggemma-300m",
+      llm: "gpt-4o-mini",
+      tool_call_counts: { semantic_search: 1, weighted_fusion: 1, graph_search: 1 },
+      retrieved_docids: [["58201"], ["44112", "58201"], ["44112"]],
+      transcript: [
+        { role_call: "planner", turn: 0, model: "gpt-4o-mini",
+          messages: [
+            { role: "system", content: "You are the Global-Planner…" },
+            { role: "user", content: "वर्तमान में कौन सा संस्थान उस स्थान से 2 से 7 मील की हवाई दूरी के भीतर स्थित है जहाँ इसकी स्थापना हुई थी? संस्थान की स्थापना 1949 से 1959 के बीच हुई थी।" },
+          ], response: "…" },
+      ],
+      result: [
+        { type: "reasoning", tool_name: null, arguments: null, role: "planner", model: "gpt-4o-mini",
+          output: "Okay, this asks for an institution founded 1949-1959, now 2-7 air miles from its founding site, with alumni including ministers, civil servants, journalists, and bank CEOs. Therefore:\nPrimary Plan: 1. Identify institutions founded 1949-1959 matching that alumni profile. 2. Confirm the founding-to-current-site distance is 2-7 miles. 3. Formulate the final answer." },
+        { type: "reasoning", tool_name: null, arguments: null, role: "reasoner", model: "gpt-4o-mini",
+          decision: { decision: "proceed", analysis: "No evidence gathered yet. Okay, I'll proceed: the alumni description is distinctive, so a broad conceptual search for the institution type is a reasonable first probe before narrowing to an exact date range." },
+          output: "" },
+        { type: "tool_call", tool_name: "semantic_search", arguments: "{\"query\": \"college founded 1950s alumni ministers civil servants\"}",
+          role: "executor", model: "gpt-4o-mini",
+          output: JSON.stringify([
+            { docid: "58201", url: "https://en.wikipedia.org/wiki/Lady_Shri_Ram_College", score: 0.6123, snippet: "Lady Shri Ram College for Women (LSR) is a women's college in New Delhi, India. It was established in 1956 by Lala Shri Ram…" },
+            { docid: "91340", url: "https://en.wikipedia.org/wiki/List_of_liberal_arts_colleges", score: 0.2011, snippet: "A list of liberal arts colleges in various countries, spanning multiple founding decades and disciplines…" },
+          ]) },
+        { type: "reasoning", tool_name: null, arguments: null, role: "reasoner", model: "gpt-4o-mini",
+          decision: { decision: "reflect_refine", analysis: "Then, the top result (Lady Shri Ram College, founded 1956) already matches the founding-decade and alumni-type criteria well, but the second result is generic noise. I'll reflect and refine: narrow with weighted fusion on the specific founding year plus the college name to confirm it, and downweight generic keyword noise." },
+          output: "" },
+        { type: "tool_call", tool_name: "weighted_fusion", arguments: "{\"query\": \"Lady Shri Ram College founded 1956\", \"w_semantic\": 0.6, \"w_exact\": 0.4}",
+          role: "executor", model: "gpt-4o-mini",
+          output: JSON.stringify([
+            { docid: "58201", url: "https://en.wikipedia.org/wiki/Lady_Shri_Ram_College", score: 0.9812, snippet: "…founded in 1956 by Lala Shri Ram in memory of his wife. The college moved from its original site in Daryaganj to its present Lajpat Nagar campus, roughly 6 miles away…" },
+            { docid: "44112", url: "https://en.wikipedia.org/wiki/Lala_Shri_Ram", score: 0.4310, snippet: "Lala Shri Ram was an Indian industrialist and philanthropist born in Sonepat, Punjab (British India)…" },
+          ]) },
+        { type: "reasoning", tool_name: null, arguments: null, role: "reasoner", model: "gpt-4o-mini",
+          decision: { decision: "conclude", analysis: "Therefore, the college's own page confirms it moved roughly 6 miles from its founding site, within the 2-7 mile range, founded in 1956 (inside 1949-1959), by Lala Shri Ram. The research is complete and I have sufficient information to answer." },
+          output: "" },
+        { type: "tool_call", tool_name: "graph_search", arguments: "{\"entity\": \"Lala Shri Ram\", \"hops\": 1}",
+          role: "executor", model: "gpt-4o-mini",
+          output: JSON.stringify([
+            { docid: "44112", url: "https://en.wikipedia.org/wiki/Lala_Shri_Ram", score: 2, snippet: "Lala Shri Ram founded Lady Shri Ram College; Lala Shri Ram born_in Sonepat" },
+          ]) },
+        { type: "output_text", tool_name: null, arguments: null, role: "executor", model: "gpt-4o-mini",
+          output: "Explanation: Lady Shri Ram College was founded in 1956 by Lala Shri Ram and moved about 6 miles from its original Daryaganj site to Lajpat Nagar; Lala Shri Ram's hometown, Sonepat, is in Haryana, the state neighboring Delhi.\nExact Answer: Lady Shri Ram College for Women" },
+      ],
+    },
+    {
+      query_id: "hi-865",
+      language: "hi",
+      retriever: "interact-rag/embeddinggemma-300m",
+      llm: "gpt-4o-mini",
+      tool_call_counts: { semantic_search: 2 },
+      retrieved_docids: [[], []],
+      result: [
+        { type: "reasoning", tool_name: null, arguments: null, role: "planner", model: "gpt-4o-mini",
+          output: "Primary Plan: 1. Identify the person with a 1989 PhD. 2. Confirm the 2014 book and 2010 co-edited volume. 3. Confirm 10 years as association vice-president before 2020. 4. Formulate the final answer." },
+        { type: "reasoning", tool_name: null, arguments: null, role: "reasoner", model: "gpt-4o-mini",
+          decision: { decision: "proceed", analysis: "No evidence yet. Proceeding with a search on the most distinctive combination: the 1989 PhD plus 2010 co-edited book." }, output: "" },
+        { type: "tool_call", tool_name: "semantic_search", arguments: "{\"query\": \"scholar PhD 1989 co-edited book 2010\"}",
+          role: "executor", model: "gpt-4o-mini", output: JSON.stringify([]) },
+        { type: "reasoning", tool_name: null, arguments: null, role: "reasoner", model: "gpt-4o-mini",
+          decision: { decision: "reflect_refine", analysis: "The last search returned nothing. I'll reflect and refine: that query was too generic for exact/semantic matching alike; after this attempt, if it fails again I'll move to a narrower clue." }, output: "" },
+        { type: "tool_call", tool_name: "semantic_search", arguments: "{\"query\": \"conference keynote speaker 2012 association vice president\"}",
+          role: "executor", model: "gpt-4o-mini", output: JSON.stringify([]) },
+        { type: "output_text", tool_name: null, arguments: null, role: "executor", model: "gpt-4o-mini",
+          output: "Explanation: insufficient evidence gathered\nExact Answer: Not found in evidence" },
+      ],
+    },
+  ];
+
+  demoBtn.addEventListener("click", function () { loadRecords(SAMPLE); });
+})();
+</script>

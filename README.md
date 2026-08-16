@@ -298,11 +298,14 @@ Interaction actions live in `interact_engine.py`, on top of the same
 - `include_docs(doc_ids)` / `exclude_docs(doc_ids)` — pin or filter specific
   documents across the rest of that query's retrievals
 
-Every retrieval action above takes an optional `top_k` (clamped to 1-50) to
-request more or fewer results for just that one call; if omitted, it falls
-back to a fixed default (`InteractionState.scale` in `interact_engine.py`,
-5 chunks). There's no separate action to change that default from within a
-run -- each call either states its own `top_k` or gets the default.
+Every retrieval action above's Python `top_k` parameter is optional and
+clamped to 1-50, falling back to a fixed default (`InteractionState.scale`
+in `interact_engine.py`, 5 chunks) when omitted -- there's no separate
+action to change that default from within a run. The Executor's tool
+schemas are stricter than that, though: `semantic_search` and
+`boolean_search` mark `top_k` as a *required* argument (the model must
+always decide and state a count for those two), while `exact_search`,
+`weighted_fusion`, and `graph_search` still leave it optional there.
 
 Unlike `agent.py` (one system prompt, one model, one growing conversation),
 `interact_agent.py` reproduces the paper's three-module workflow as three
@@ -393,6 +396,18 @@ Each role defaults to `MAST_CHAT_MODEL`, but can be pointed at its own model
 via `MAST_PLANNER_MODEL` / `MAST_REASONER_MODEL` / `MAST_EXECUTOR_MODEL` /
 `MAST_SCRATCHPAD_MODEL` in `.env` (e.g. a cheap model for planning, a
 stronger one for reasoning) — see `config.py`.
+
+**Checkpointed after every turn:** `interact_runner.py` passes `answer()` a
+`checkpoint_path` (`runs/{model}/checkpoints/{language}/{query_id}.json`),
+which gets overwritten with the trajectory so far -- scratchpad notes
+included, since they're already part of `result` -- after every turn
+(write-then-rename, so a kill mid-write can't corrupt it). This is on top
+of the mid-run failure handling above: that covers exceptions `answer()`
+catches itself (timeouts, connection drops, 5xx), while the checkpoint file
+covers a hard crash or kill that skips that `except` entirely, so even then
+you don't lose progress past the last completed turn. The checkpoint is
+deleted once the query's real record lands in the run's JSONL; left behind
+otherwise for postmortem.
 
 **Tracing what each role did:** every step lands in the run JSONL's `result`
 field (always written, no flag needed) tagged with `role`
