@@ -473,6 +473,137 @@ def _overcompound_query_error(query: str) -> str | None:
     )
 
 
+# Complements `_overcompound_query_error` above for a related but distinct
+# failure mode: instead of one query cramming several facts together, the
+# model re-issues essentially the *same* sub-question turn after turn --
+# paraphrased, or bounced between semantic_search/exact_search/boolean_search/
+# weighted_fusion/graph_search -- without converging (observed on real
+# traces: a single query burning 80+ retrieval calls, nearly all
+# restatements of one unresolved sub-task). The Reasoner prompt already says
+# "if a sub-task remains unresolved after 3 attempts, consider moving on"
+# (see REASONER_SYSTEM_PROMPT above), but that's advisory text the model is
+# free to ignore. This enforces it in code instead.
+#
+# Each retrieval call is matched (word-overlap Jaccard) against every prior
+# call this episode, joining whichever prior call's cluster it's closest to
+# (nearest-neighbor, not a fixed per-cluster representative) so paraphrases
+# that drift turn-by-turn still chain into one cluster even when two
+# non-adjacent calls in it don't directly overlap much. Once a cluster's
+# count passes `_REPEAT_MAX_ATTEMPTS`, further calls into it are blocked
+# before reaching the engine -- the model sees a message telling it to
+# change tack instead of real search results. Deliberately blunt (lexical
+# overlap, not embeddings) to stay fast and dependency-free, same spirit as
+# `_overcompound_query_error` above.
+_REPEAT_SIMILARITY_THRESHOLD = 0.35
+_REPEAT_MAX_ATTEMPTS = 3
+_TOKEN_RE = re.compile(r"[a-zA-Z0-9]+")
+_REPEAT_STOPWORDS = {
+    "a", "an", "the", "of", "in", "on", "at", "to", "for", "and", "or", "with",
+    "who", "what", "when", "where", "which", "that", "this", "was", "is",
+    "were", "are", "be", "been", "by", "from", "as", "their", "its", "his",
+    "her", "did", "does",
+}
+
+
+def _query_text_for_repeat_check(name: str, args: dict) -> str:
+    """Extracts the part of each retrieval action's arguments that carries
+    its actual sub-question, so calls across different tools can still be
+    compared (e.g. a semantic_search and an exact_search both circling the
+    same unresolved fact)."""
+    if name in ("semantic_search", "weighted_fusion"):
+        return args.get("query", "")
+    if name == "exact_search":
+        return args.get("keywords", "")
+    if name == "boolean_search":
+        return " ".join((args.get("and_terms") or []) + (args.get("or_terms") or []))
+    if name == "graph_search":
+        return args.get("entity", "")
+    return ""
+
+
+def _query_tokens(text: str) -> set[str]:
+    words = (w.lower() for w in _TOKEN_RE.findall(text or ""))
+    return {w for w in words if w not in _REPEAT_STOPWORDS and len(w) > 2}
+
+
+def _jaccard(a: set[str], b: set[str]) -> float:
+    if not a or not b:
+        return 0.0
+    union = len(a | b)
+    return len(a & b) / union if union else 0.0
+
+
+class _RepeatQuestionGuard:
+    """Per-episode state tracking whether the Executor keeps circling the
+    same sub-question via retrieval calls -- see the module comment above.
+
+    Beyond blocking, this doubles as the source for `tried_summary()`: a
+    running "already tried" digest surfaced to the Reasoner/Executor so they
+    have explicit memory of exact past query strings, not just the
+    scratchpad's synthesized outcomes -- prevention (don't regenerate a
+    duplicate) on top of the blocking above (reject it if they do anyway).
+    """
+
+    def __init__(self) -> None:
+        self._entries: list[tuple[set[str], int]] = []  # (tokens, cluster_id)
+        self._cluster_counts: dict[int, int] = {}
+        self._cluster_repr: dict[int, tuple[str, str]] = {}  # cluster_id -> (tool_name, raw_query_text)
+        self._cluster_order: list[int] = []
+        self._next_cluster_id = 0
+
+    def check(self, name: str, args: dict) -> str | None:
+        """Returns a blocking message if this call's sub-question cluster
+        has already been attempted `_REPEAT_MAX_ATTEMPTS` times, else None.
+        Records the call either way so the cluster keeps growing."""
+        raw_text = _query_text_for_repeat_check(name, args)
+        tokens = _query_tokens(raw_text)
+        best_cluster, best_sim = None, 0.0
+        for prev_tokens, cluster_id in self._entries:
+            sim = _jaccard(tokens, prev_tokens)
+            if sim > best_sim:
+                best_sim, best_cluster = sim, cluster_id
+        if best_cluster is not None and best_sim >= _REPEAT_SIMILARITY_THRESHOLD:
+            cluster_id = best_cluster
+        else:
+            cluster_id = self._next_cluster_id
+            self._next_cluster_id += 1
+            self._cluster_repr[cluster_id] = (name, raw_text)
+            self._cluster_order.append(cluster_id)
+        self._cluster_counts[cluster_id] = self._cluster_counts.get(cluster_id, 0) + 1
+        self._entries.append((tokens, cluster_id))
+        count = self._cluster_counts[cluster_id]
+        if count > _REPEAT_MAX_ATTEMPTS:
+            return (
+                f"blocked: this is attempt #{count} at essentially the same "
+                "sub-question via search -- semantic_search/exact_search/"
+                "boolean_search/weighted_fusion/graph_search calls restating "
+                f"the same facts all count against each other. After "
+                f"{_REPEAT_MAX_ATTEMPTS} unproductive attempts on one "
+                "sub-task, per policy you must stop retrying it: try "
+                "graph_search on a specific entity you've already found, move "
+                "on to the next sub-task, or conclude with your best answer "
+                "from the evidence already gathered. This call was not "
+                "executed."
+            )
+        return None
+
+    def tried_summary(self) -> str:
+        """Renders one line per distinct sub-question cluster seen so far
+        -- its first (representative) query string plus how many times
+        that same sub-question has been attempted -- so the Reasoner/
+        Executor can see at a glance what's already been searched instead
+        of re-deriving it from the scratchpad's synthesized notes."""
+        if not self._cluster_order:
+            return "(no searches performed yet)"
+        lines = []
+        for cluster_id in self._cluster_order:
+            name, raw_text = self._cluster_repr[cluster_id]
+            count = self._cluster_counts[cluster_id]
+            attempts = f"{count}x" if count > 1 else "1x"
+            lines.append(f'- {name}("{raw_text}") -- tried {attempts}')
+        return "\n".join(lines)
+
+
 def _dispatch(engine: CorpusInteractionEngine, name: str, args: dict) -> tuple[str, list[str]]:
     """Run one action against the engine; returns (tool_output_text, docids)."""
     top_k = int(args["top_k"]) if args.get("top_k") is not None else None
@@ -633,13 +764,18 @@ class InteractAgent:
         return plan
 
     def _run_reasoner(
-        self, question: str, plan: str, scratchpad_log: list[dict], force_answer: bool,
-        turn: int, transcript: list[dict],
+        self, question: str, plan: str, scratchpad_log: list[dict], tried_summary: str,
+        force_answer: bool, turn: int, transcript: list[dict],
     ) -> dict:
         user_content = (
             f"Original question (in the source language): {question}\n\n"
             f"Global-Planner's plan:\n{plan}\n\n"
-            f"Scratchpad Log:\n{_format_scratchpad(scratchpad_log)}\n"
+            f"Scratchpad Log:\n{_format_scratchpad(scratchpad_log)}\n\n"
+            "Already-tried search queries this episode (grouped by "
+            "similarity -- do not propose another rewording of one of "
+            "these; if a sub-task's queries are already at 3+ attempts, "
+            f"propose a different retrieval mode, a different sub-task, or "
+            f"concluding instead):\n{tried_summary}\n"
         )
         if not self.engine.entity_graph.is_built:
             user_content += (
@@ -683,7 +819,8 @@ class InteractAgent:
         return [t for t in INTERACT_TOOLS if t["function"]["name"] != "graph_search"]
 
     def _run_executor(
-        self, question: str, analysis: str, force_answer: bool, turn: int, transcript: list[dict],
+        self, question: str, analysis: str, tried_summary: str, force_answer: bool,
+        turn: int, transcript: list[dict],
     ) -> dict:
         """Runs the Executor -- which, per the paper, decides for itself each
         turn whether to search or to conclude with the final answer. Returns
@@ -695,6 +832,8 @@ class InteractAgent:
         user_content = (
             f"Original question (in the source language): {question}\n\n"
             f"Adaptive-Reasoner's analysis of prior search results:\n{analysis}\n\n"
+            "Already-tried search queries this episode (do not restate one "
+            f"of these with cosmetic rewording):\n{tried_summary}\n\n"
         )
         if not self.engine.entity_graph.is_built:
             user_content += (
@@ -791,6 +930,7 @@ class InteractAgent:
         result: list[dict] = []
         scratchpad_log: list[dict] = []
         transcript: list[dict] = []
+        repeat_guard = _RepeatQuestionGuard()
         final_answer = ""
         error: str | None = None
 
@@ -824,11 +964,13 @@ class InteractAgent:
                 last_turn = turn == config.max_turns - 1
                 _debug(f"--- turn {turn + 1}/{config.max_turns}{' (final, must answer)' if last_turn else ''}")
 
+                tried_summary = repeat_guard.tried_summary()
+
                 # Advisory only -- the Reasoner never ends the episode itself
                 # (matching the paper); the Executor below decides that every
                 # turn, regardless of which path the Reasoner narrated here.
                 decision = self._run_reasoner(
-                    query_text, plan, scratchpad_log, force_answer=last_turn,
+                    query_text, plan, scratchpad_log, tried_summary, force_answer=last_turn,
                     turn=turn + 1, transcript=transcript,
                 )
                 _debug(f"reasoner decision: {decision['decision']} - {decision['analysis'][:300]}")
@@ -843,7 +985,7 @@ class InteractAgent:
                 })
 
                 exec_result = self._run_executor(
-                    query_text, decision["analysis"], force_answer=last_turn,
+                    query_text, decision["analysis"], tried_summary, force_answer=last_turn,
                     turn=turn + 1, transcript=transcript,
                 )
 
@@ -878,7 +1020,11 @@ class InteractAgent:
                 turn_tool_results: list[tuple[str, dict, str]] = []
                 for name, args in tool_calls:
                     tool_call_counts[name] = tool_call_counts.get(name, 0) + 1
-                    tool_output, docids = _dispatch(self.engine, name, args)
+                    blocked = repeat_guard.check(name, args) if name in RETRIEVAL_ACTIONS else None
+                    if blocked:
+                        tool_output, docids = json.dumps({"error": blocked}), []
+                    else:
+                        tool_output, docids = _dispatch(self.engine, name, args)
                     if name in RETRIEVAL_ACTIONS:
                         retrieved_docids.append(docids)
                     turn_tool_results.append((name, args, tool_output))

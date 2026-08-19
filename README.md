@@ -365,17 +365,54 @@ clause question (observed on a real trace: 50+ `semantic_search` calls, all
 restating one 5-constraint question, none of them converging, since dense
 retrieval collapses that whole sentence into one vector that's diluted
 toward *any* one clause rather than sharp on the document satisfying all of
-them). `interact_agent.py`'s `_dispatch` now rejects `semantic_search`/
-`weighted_fusion` queries that look overcompound (`_overcompound_query_error`
--- longer than 14 words or more than 3 comma/and/or-separated clauses)
-before they ever reach the engine, returning an error explaining why and
-pushing the Executor to split the question into single-fact searches
-instead. This is a blunt heuristic, not a real parser: it reliably catches
-comma-separated lists of constraints but can miss an equally overcompound
-query that omits punctuation (e.g. a run of nouns with no "and"/comma
-between them). `exact_search`/`boolean_search` aren't gated the same way --
-BM25 doesn't dilute the same way dense retrieval does, so more terms mostly
-just narrows the match rather than blurring it.
+them). `interact_agent.py`'s `_dispatch` rejects `weighted_fusion` queries
+that look overcompound (`_overcompound_query_error` -- longer than 14 words
+or more than 3 comma/and/or-separated clauses) before they ever reach the
+engine, returning an error explaining why and pushing the Executor to split
+the question into single-fact searches instead. (The same check exists for
+`semantic_search` in `_dispatch` but is currently commented out.) This is a
+blunt heuristic, not a real parser: it reliably catches comma-separated
+lists of constraints but can miss an equally overcompound query that omits
+punctuation (e.g. a run of nouns with no "and"/comma between them).
+`exact_search`/`boolean_search` aren't gated the same way -- BM25 doesn't
+dilute the same way dense retrieval does, so more terms mostly just narrows
+the match rather than blurring it.
+
+**Repeat-question guard:** a related but distinct failure mode from the one
+above: instead of one overcompound query, the model re-issues essentially
+the *same* sub-question turn after turn -- paraphrased, or bounced between
+`semantic_search`/`exact_search`/`boolean_search`/`weighted_fusion`/
+`graph_search` -- without converging (observed on real traces: a single
+query burning 80+ retrieval calls, nearly all restatements of one unresolved
+sub-task). The Reasoner prompt already says "if a sub-task remains
+unresolved after 3 attempts, consider moving on," but that's advisory text a
+model is free to ignore. `_RepeatQuestionGuard` in `interact_agent.py`
+enforces it: each retrieval call's query text (the relevant argument per
+tool -- `query`, `keywords`, `entity`, or `and_terms`+`or_terms`) is matched
+by word-overlap (Jaccard, stopwords stripped) against every prior call in
+the episode, joining whichever prior call's cluster it's nearest to --
+paraphrases that drift turn-by-turn still chain into one cluster even when
+two non-adjacent calls in it don't directly overlap much. Once a cluster has
+been attempted more than 3 times, further calls into it are blocked before
+reaching the engine, returning a message telling the Executor to try
+`graph_search`, move to the next sub-task, or conclude -- instead of real
+search results. Replaying it against `runs/interact_hi_v2.jsonl` blocked 69%
+of all retrieval calls (738/1067), concentrated in the handful of queries
+that were burning 80-97 calls apiece circling one unresolved sub-question.
+
+The guard above only catches a repeat *after* the Executor has already
+regenerated it. `_RepeatQuestionGuard.tried_summary()` addresses the cause,
+not just the symptom: it renders one line per distinct sub-question cluster
+seen so far -- its first query string plus an attempt count, e.g. `-
+semantic_search("historian wrote biography at request of niece") -- tried
+3x` -- and both `_run_reasoner` and `_run_executor` are given this digest in
+their prompts every turn, alongside an explicit instruction not to reword
+something already on the list. This is prevention layered on top of the
+guard's blocking: the scratchpad note the Reasoner otherwise relies on
+synthesizes *outcomes* ("what was found"), not the literal query strings
+used to get there, so without this the model can lose track of exactly what
+phrasing it already tried and regenerate a near-duplicate in good faith,
+not just by ignoring guidance.
 
 **Scratchpad instead of raw evidence:** rather than restating every turn's
 raw search results to the Reasoner on the next turn, a dedicated

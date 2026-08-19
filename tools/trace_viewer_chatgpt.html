@@ -399,17 +399,80 @@
   }
   .question-box.unknown { color: var(--ink-muted); font-style: italic; font-family: var(--font-mono); font-size: 12px; }
 
-  .timeline-scroll {
+  .trajectory-nav {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 8px 24px;
+    border-bottom: 1px solid var(--border-soft);
+    background: var(--surface);
+    flex-shrink: 0;
+  }
+  .trajectory-nav-group {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+  }
+  .turn-nav-btn {
+    border: 1px solid var(--border);
+    background: var(--surface-2);
+    color: var(--ink);
+    border-radius: 7px;
+    padding: 5px 10px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    transition: transform .18s ease, border-color .18s ease, opacity .18s ease, background .18s ease;
+  }
+  .turn-nav-btn:hover:not(:disabled) {
+    transform: translateY(-1px);
+    border-color: var(--accent);
+    background: var(--accent-soft);
+  }
+  .turn-nav-btn:disabled { opacity: .38; cursor: default; }
+  .turn-position {
+    min-width: 100px;
+    text-align: center;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--ink-muted);
+  }
+  .trajectory-scroll {
     flex: 1;
-    overflow-y: auto;
-    padding: 22px 24px 60px;
+    min-height: 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 22px 24px 30px;
+    scroll-behavior: smooth;
+    overscroll-behavior: contain;
+    scrollbar-width: thin;
+    -webkit-overflow-scrolling: touch;
+    scroll-snap-type: x mandatory;
   }
   .timeline {
-    max-width: 760px;
-    margin: 0 auto;
     position: relative;
+    display: flex;
+    width: 100%;
+    height: 100%;
+    margin: 0 auto;
   }
-  .timeline::before {
+  .turn, .verdict {
+    position: relative;
+    flex: 0 0 100%;
+    width: 100%;
+    height: 100%;
+    min-height: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding-left: 52px;
+    padding-right: 8px;
+    padding-bottom: 20px;
+    margin: 0;
+    scroll-snap-align: start;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+  }
+  .turn::before, .verdict::before {
     content: "";
     position: absolute;
     left: 19px;
@@ -417,12 +480,6 @@
     bottom: 6px;
     width: 2px;
     background: var(--border);
-  }
-
-  .turn {
-    position: relative;
-    padding-left: 52px;
-    margin-bottom: 22px;
   }
   .turn-badge {
     position: absolute;
@@ -741,20 +798,9 @@
       to   { transform: scaleX(1); }
     }
 
-    .timeline-scroll {
-      scroll-behavior: smooth;
-      overscroll-behavior: contain;
-      scrollbar-gutter: stable;
-    }
   }
 
-  /* Keep the inner trace independently scrollable on desktop and mobile. */
-  .timeline-scroll {
-    min-height: 0;
-    -webkit-overflow-scrolling: touch;
-    overscroll-behavior-y: contain;
-    touch-action: pan-y;
-  }
+  .trajectory-scroll { touch-action: pan-x; }
 
   /* ---------------- Reveal animations: each turn/card animates in as you
      scroll it into view (IntersectionObserver toggles .in-view -- see the
@@ -1185,19 +1231,29 @@
 
     main.appendChild(top);
 
-    // -- scrolling timeline --
-    // Each .turn/.verdict block starts hidden and gets an .in-view class
-    // (see the CSS) once revealObserver sees it enter the viewport, so
-    // scrolling down through a trace visibly reveals it turn by turn
-    // rather than everything fading in at once on load. Within a turn,
-    // each card gets a small transition-delay of its own (reset per turn)
-    // so its cards ripple in shortly after the turn itself appears.
-    var scroll = el("div", "timeline-scroll");
-    // Make the trace a real keyboard-scroll target as well as a mouse/touch
-    // scroll container. This also prevents page-level key handlers from
-    // stealing the user's ArrowDown/ArrowUp navigation.
+    // -- horizontal trajectory --
+    // Each turn is a full-width slide. The slide itself remains vertically
+    // scrollable when a turn contains many executor/tool cards.
+    var nav = el("div", "trajectory-nav");
+    var prevBtn = el("button", "turn-nav-btn", "← Previous");
+    prevBtn.type = "button";
+    prevBtn.setAttribute("aria-label", "Previous turn");
+    var pos = el("div", "turn-position", "Turn 0 of 0");
+    var nextBtn = el("button", "turn-nav-btn", "Next →");
+    nextBtn.type = "button";
+    nextBtn.setAttribute("aria-label", "Next turn");
+    var leftGroup = el("div", "trajectory-nav-group");
+    leftGroup.appendChild(prevBtn);
+    nav.appendChild(leftGroup);
+    nav.appendChild(pos);
+    var rightGroup = el("div", "trajectory-nav-group");
+    rightGroup.appendChild(nextBtn);
+    nav.appendChild(rightGroup);
+    main.appendChild(nav);
+
+    var scroll = el("div", "trajectory-scroll");
     scroll.tabIndex = 0;
-    scroll.setAttribute("aria-label", "Trace timeline");
+    scroll.setAttribute("aria-label", "Horizontal trace trajectory");
     var timeline = el("div", "timeline");
     var CARD_STEP_MS = 70;
     var CARD_STEP_MAX_MS = 260;
@@ -1269,7 +1325,37 @@
     scroll.appendChild(timeline);
     main.appendChild(scroll);
 
-    var hint = el("div", "kbd-hint", 'Use <kbd>↑</kbd> <kbd>↓</kbd> to scroll the trace · <kbd>Alt</kbd> + <kbd>↑</kbd> <kbd>↓</kbd> to switch queries.');
+    var slides = Array.prototype.slice.call(timeline.children);
+    var activeTurn = 0;
+    function updateTurnNav(index, smooth) {
+      if (!slides.length) return;
+      activeTurn = Math.max(0, Math.min(slides.length - 1, index));
+      var target = slides[activeTurn];
+      if (smooth) target.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "start" });
+      else target.scrollIntoView({ behavior: "auto", block: "nearest", inline: "start" });
+      slides.forEach(function (slide, i) {
+        if (i === activeTurn) slide.classList.add("in-view");
+      });
+      prevBtn.disabled = activeTurn === 0;
+      nextBtn.disabled = activeTurn === slides.length - 1;
+      var label = activeTurn === 0 && grouped.planner ? "Planning" :
+        (activeTurn === slides.length - 1 && grouped.verdict ? "Final answer" : "Turn " + activeTurn);
+      pos.textContent = (activeTurn + 1) + " / " + slides.length + " · " + label;
+    }
+    prevBtn.addEventListener("click", function () { updateTurnNav(activeTurn - 1, true); });
+    nextBtn.addEventListener("click", function () { updateTurnNav(activeTurn + 1, true); });
+
+    var lastScrollLeft = -1;
+    scroll.addEventListener("scroll", function () {
+      var width = scroll.clientWidth || 1;
+      var idx = Math.round(scroll.scrollLeft / width);
+      if (idx !== activeTurn && idx >= 0 && idx < slides.length) updateTurnNav(idx, false);
+      lastScrollLeft = scroll.scrollLeft;
+    }, { passive: true });
+
+    updateTurnNav(0, false);
+
+    var hint = el("div", "kbd-hint", 'Use <kbd>←</kbd> <kbd>→</kbd> or the buttons to move through turns · <kbd>↑</kbd> <kbd>↓</kbd> scroll within a turn · <kbd>Alt</kbd> + <kbd>↑</kbd> <kbd>↓</kbd> switches queries.');
     main.appendChild(hint);
   }
 
@@ -1319,19 +1405,27 @@
   document.addEventListener("keydown", function (e) {
     if (!records.length) return;
 
-    // Do not hijack the arrow keys while the user is navigating the trace.
-    // ArrowUp / ArrowDown should scroll the .timeline-scroll normally.
     if (document.activeElement === searchBox) return;
 
-    // Query navigation is now Alt+ArrowUp / Alt+ArrowDown.
-    // Plain arrows remain available for scrolling the example/trace pane.
+    // Alt+Up/Down switches queries. Plain Up/Down remain vertical scrolling.
     if (e.altKey && e.key === "ArrowDown") {
       e.preventDefault();
       selectRecord(Math.min(records.length - 1, activeIndex + 1));
+      return;
     }
     if (e.altKey && e.key === "ArrowUp") {
       e.preventDefault();
       selectRecord(Math.max(0, activeIndex - 1));
+      return;
+    }
+
+    // Left/Right navigate turns when the trajectory has focus; otherwise let
+    // the browser handle them normally.
+    var trajectory = document.querySelector(".trajectory-scroll");
+    if (trajectory && document.activeElement === trajectory && (e.key === "ArrowLeft" || e.key === "ArrowRight")) {
+      e.preventDefault();
+      var current = Math.round(trajectory.scrollLeft / (trajectory.clientWidth || 1));
+      trajectory.children[0].children[Math.max(0, Math.min(trajectory.children[0].children.length - 1, current + (e.key === "ArrowRight" ? 1 : -1)))]?.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "start" });
     }
   });
 
